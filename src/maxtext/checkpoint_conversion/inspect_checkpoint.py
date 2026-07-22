@@ -68,6 +68,8 @@ import pathlib
 import absl
 from maxtext.inference.inference_utils import str2bool
 from maxtext.checkpoint_conversion.utils.utils import print_peak_memory
+from maxtext.utils.model_creation_utils import create_nnx_abstract_model
+from flax import nnx
 
 
 def natural_sort_key(s: str):
@@ -238,15 +240,19 @@ def inspect_maxtext(args, remaining_args):
   print(argv)
   config = pyconfig.initialize(argv)
 
-  print(f"\n--- Inspecting MaxText Architecture: {config.model_name} (Scan: {config.scan_layers}) ---")
+  print(
+      f"\n--- Inspecting MaxText Architecture: {config.model_name} "
+      f"(scan_layers: {config.scan_layers}, enable_nnx: {config.enable_nnx}) ---"
+  )
   devices_array = maxtext_utils.create_device_mesh(config)
   mesh = jax.sharding.Mesh(devices_array, config.mesh_axes)
-  quant = quantizations.configure_quantization(config)
-  model = Transformer(config, mesh=mesh, quant=quant)
-
-  # Extract abstract parameters. This returns a PyTree of `ShapeDtypeStruct`
-  # objects, without materializing weights.
-  abstract_param = maxtext_utils.get_abstract_param(model, config)
+  if config.enable_nnx:
+    _, abstract_model = create_nnx_abstract_model(config, mesh=mesh)
+    _, abstract_param, _ = nnx.split(abstract_model, nnx.Param, ...)
+  else:
+    quant = quantizations.configure_quantization(config)
+    model = Transformer(config, mesh=mesh, quant=quant)
+    abstract_param = maxtext_utils.get_abstract_param(model, config)
 
   # Calculate and display the total parameter count based purely on abstract shapes.
   num_params = max_utils.calculate_num_params_from_pytree(abstract_param)
@@ -261,8 +267,12 @@ def inspect_maxtext(args, remaining_args):
   for path_tuple, abstract_leaf_value in abstract_params_flat:
     key_parts = param_key_parts_from_path(path_tuple)
 
-    # Construct a MaxText-style parameter key (e.g., "params.params.layer.weight").
-    param_key = "params." + ".".join(key_parts)
+    # Construct a MaxText-style parameter key.
+    key_str = ".".join(key_parts)
+    if getattr(config, "enable_nnx", False) and not (key_str.startswith("params") or key_str.startswith("Tid2EidVar")):
+      param_key = "params.params." + key_str
+    else:
+      param_key = "params." + key_str
 
     shape = abstract_leaf_value.shape
     param_dict[param_key] = f"shape: {shape}"
@@ -294,6 +304,7 @@ def inspect_orbax(args):
   # Defer imports to avoid overhead when running in other modes.
   import orbax.checkpoint as ocp
   from etils import epath
+  from maxtext.checkpoint_conversion.utils.utils import param_key_parts_from_path
 
   path = epath.Path(args.path)
 
@@ -309,9 +320,12 @@ def inspect_orbax(args):
   # Filter strictly for parameter keys and format them.
   param_dict = {}
   for k, v in dictionary.items():
-    # `k` is a tuple representing the path hierarchy; join it into a single string.
-    # `v` is a metadata object containing `.shape` and `.dtype`.
-    param_key = ".".join(k)
+    # `k` is a tuple representing the path hierarchy.
+    # Pass it through param_key_parts_from_path to normalize NNX structures
+    # (folding list indices like "0" into "layers_0" and dropping "value").
+    key_parts = param_key_parts_from_path(k)
+    param_key = ".".join(key_parts)
+
     if not param_key.startswith("params"):
       continue
 
