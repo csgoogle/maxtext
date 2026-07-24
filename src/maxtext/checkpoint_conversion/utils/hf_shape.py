@@ -1211,16 +1211,16 @@ def DEEPSEEKV4_HF_WEIGHTS_TO_SHAPE(config):
         f"{layer_prefix}.attn.wkv.weight": [kv_lora_rank, hidden_size],
         f"{layer_prefix}.attn.kv_norm.weight": [kv_lora_rank],
         f"{layer_prefix}.attn.wo_a.weight": [o_proj_in_dim, config.get("o_lora_rank", 1024)],
-        f"{layer_prefix}.attn.wo_b.weight": [hidden_size, config.get("o_groups", 8) * config.get("o_lora_rank", 1024)],
+        f"{layer_prefix}.attn.wo_b.weight": [hidden_size, config.get("o_lora_rank", 1024)],
         
         f"{layer_prefix}.attn.attn_sink": [64],
         
-        f"{layer_prefix}.hc_attn_fn": [6 * mhc_expansion_rate, hidden_size * mhc_expansion_rate],
-        f"{layer_prefix}.hc_attn_base": [6 * mhc_expansion_rate],
+        f"{layer_prefix}.hc_attn_fn": [3 * mhc_expansion_rate, hidden_size * mhc_expansion_rate],
+        f"{layer_prefix}.hc_attn_base": [3 * mhc_expansion_rate],
         f"{layer_prefix}.hc_attn_scale": [3],
         
-        f"{layer_prefix}.hc_ffn_fn": [6 * mhc_expansion_rate, hidden_size * mhc_expansion_rate],
-        f"{layer_prefix}.hc_ffn_base": [6 * mhc_expansion_rate],
+        f"{layer_prefix}.hc_ffn_fn": [3 * mhc_expansion_rate, hidden_size * mhc_expansion_rate],
+        f"{layer_prefix}.hc_ffn_base": [3 * mhc_expansion_rate],
         f"{layer_prefix}.hc_ffn_scale": [3],
     }
 
@@ -1250,7 +1250,7 @@ def DEEPSEEKV4_HF_WEIGHTS_TO_SHAPE(config):
       layer_mapping[f"{layer_prefix}.ffn.gate.bias"] = [n_routed_experts]
     if layer_idx < 3:
       layer_mapping.update({
-          f"{layer_prefix}.ffn.gate.tid2eid": [vocab_size, config.get("first_num_hash_layers", 3)],
+          f"{layer_prefix}.ffn.gate.tid2eid": [vocab_size],
       })
     layer_mapping.update({
         f"{layer_prefix}.ffn.gate.weight": [n_routed_experts, hidden_size],
