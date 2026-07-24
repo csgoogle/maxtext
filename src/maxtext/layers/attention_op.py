@@ -1124,8 +1124,8 @@ class AttentionOp(nnx.Module):
         return out, None, None
 
       else:
-        if model_mode == MODEL_MODE_AUTOREGRESSIVE:
-          # fallback to dot_product as pallas gpu flash attention doesn't support decode stage
+        if model_mode == MODEL_MODE_AUTOREGRESSIVE or target_hardware == "cpu":
+          # fallback to dot_product as pallas gpu flash attention doesn't support decode stage or CPU
           return self.apply_attention_dot(
               query,
               key,
