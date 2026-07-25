@@ -411,6 +411,9 @@ class MaxTextDistillationTrainer(peft_trainer.PeftTrainer):
     Returns:
       A new MaxTextTrainingInput containing the Teacher's outputs (logits).
     """
+    if hasattr(input_data, "microbatches"):
+      input_data.microbatches = [self._prepare_inputs(mb) for mb in input_data.microbatches]
+      return input_data
 
     # 3. Return extended object so fields are available for Student training step
     # pylint: disable=unexpected-keyword-arg
