@@ -50,6 +50,7 @@ class Qwen3CheckpointConversionTest(unittest.TestCase):
           "override_model_config=True",
           "scan_layers=False",
           "hardware=cpu",
+          "attention=dot_product",
           "skip_jax_distributed_system=True",
           "checkpoint_storage_use_ocdbt=False",
           "checkpoint_storage_use_zarr3=False",
