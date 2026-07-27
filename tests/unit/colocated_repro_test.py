@@ -29,34 +29,34 @@ class ColocatedProcessCountReproTest(unittest.TestCase):
     def mock_preprocessing_fn(dataset):
       return dataset
 
-    # Simulate stale jax.process_count() == 1 during sidecar topology transition
-    with patch.object(jax, "process_count", return_value=1), \
-         patch.object(jax, "process_index", return_value=0):
-      stale_iterator = RemoteIterator(
-          get_ds_fn=mock_get_ds_fn,
-          preprocessing_fn=mock_preprocessing_fn,
-          global_shape=(global_batch_size, 2048),
-          checkpoint_path=None,
-          elastic=True,
-      )
-      batch = next(stale_iterator.iterator)
-      # Notice the shape mismatch: got (128, 2048) instead of expected (32, 2048)!
-      self.assertEqual(batch.shape, (128, 2048))
-      self.assertNotEqual(batch.shape, (expected_slice_batch, 2048))
+    # Simulate stale topology fallback where process_count evaluates to 1
+    stale_iterator = RemoteIterator(
+        get_ds_fn=mock_get_ds_fn,
+        preprocessing_fn=mock_preprocessing_fn,
+        global_shape=(global_batch_size, 2048),
+        checkpoint_path=None,
+        process_count=1,
+        process_index=0,
+        elastic=True,
+    )
+    batch = next(stale_iterator.iterator)
+    # Notice the shape mismatch: got (128, 2048) instead of expected (32, 2048)!
+    self.assertEqual(batch.shape, (128, 2048))
+    self.assertNotEqual(batch.shape, (expected_slice_batch, 2048))
 
     # Simulate passing explicit topology (process_count=4) from validated mesh
-    with patch.object(jax, "process_count", return_value=4), \
-         patch.object(jax, "process_index", return_value=0):
-      synced_iterator = RemoteIterator(
-          get_ds_fn=mock_get_ds_fn,
-          preprocessing_fn=mock_preprocessing_fn,
-          global_shape=(global_batch_size, 2048),
-          checkpoint_path=None,
-          elastic=True,
-      )
-      batch = next(synced_iterator.iterator)
-      # Notice the shape matches exactly: (32, 2048)!
-      self.assertEqual(batch.shape, (expected_slice_batch, 2048))
+    synced_iterator = RemoteIterator(
+        get_ds_fn=mock_get_ds_fn,
+        preprocessing_fn=mock_preprocessing_fn,
+        global_shape=(global_batch_size, 2048),
+        checkpoint_path=None,
+        process_count=4,
+        process_index=0,
+        elastic=True,
+    )
+    batch = next(synced_iterator.iterator)
+    # Notice the shape matches exactly: (32, 2048)!
+    self.assertEqual(batch.shape, (expected_slice_batch, 2048))
 
 
 if __name__ == "__main__":

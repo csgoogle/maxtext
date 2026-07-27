@@ -183,17 +183,19 @@ def _colocated_cpu_mesh(mesh: Mesh) -> Mesh:
 class RemoteIterator:
   "iterator class for using colocated python class"
 
-  def __init__(self, get_ds_fn, preprocessing_fn, global_shape, checkpoint_path, elastic=False):
+  def __init__(self, get_ds_fn, preprocessing_fn, global_shape, checkpoint_path, process_count, process_index, elastic=False):
     self.get_ds_fn = get_ds_fn
     self.preprocessing_fn = preprocessing_fn
     self.global_shape = global_shape
     self.checkpoint_path = checkpoint_path
+    self.process_count = process_count
+    self.process_index = process_index
     self.elastic = elastic
     self.reset()
     max_logging.log("RemoteIterator initiated")
 
   def reset(self):
-    ds = self.get_ds_fn(dataloading_host_index=jax.process_index(), dataloading_host_count=jax.process_count())
+    ds = self.get_ds_fn(dataloading_host_index=self.process_index, dataloading_host_count=self.process_count)
     dataloader = self.preprocessing_fn(dataset=ds)
     if hasattr(dataloader, "as_numpy_iterator"):
       self.iterator = dataloader.as_numpy_iterator()
@@ -277,12 +279,16 @@ class RemoteIteratorWrapper:
     self.dummy_array = jax.device_put(self.dummy_array, self.cpu_sharding)
     # This is a proxy to a RemoteIterator running in a colocated process,
     # named "local_iterator" to match MultiHostDataLoadIterator's interface.
+    process_count = max(d.process_index for d in global_mesh.devices.flat) + 1
+    process_index = global_mesh.local_devices[0].process_index
     remote_iterator_cls = colocated_python.colocated_python_class(RemoteIterator)
     self.local_iterator = remote_iterator_cls(
         get_ds_fn,  # pyrefly: ignore[bad-argument-count]
         preprocessing_fn,
         global_shape,
         checkpoint_path,
+        process_count,
+        process_index,
         elastic=elastic,  # pyrefly: ignore[unexpected-keyword]
     )
     max_logging.log("RemoteIteratorWrapper initiated")
