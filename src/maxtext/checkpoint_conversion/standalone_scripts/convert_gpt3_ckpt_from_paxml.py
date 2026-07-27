@@ -118,6 +118,8 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
   )
 
   state, _, _, _, _ = maxtext_utils.setup_training_state(None, cfg, mesh, checkpoint_manager, init_state_fn)
+  if cfg.pure_nnx:
+    state = train_state_nnx.to_checkpoint_dict(state)
   max_logging.log("start")
   max_utils.print_mem_stats("After params initialized")
 
@@ -202,18 +204,9 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
   }
 
   if cfg.pure_nnx:
-    # NNX state-tree paths after `nnx.split(TrainStateNNX)`. The state is a
-    # nested `nnx.State` (dict-like Mapping) with `nnx.Variable` leaves, so
-    # `jax.tree_util.keystr` produces dict-style entries (`['key']`) plus
-    # `.value` for the Variable leaf, plus `[idx]` for the optax tuple:
-    #   model params   -> ['model']<rest>.value
-    #   adam mu / nu   -> ['optimizer']['opt_state'][0]['mu' | 'nu']<rest>.value
-    #   step           -> ['optimizer']['step'].value
-    #   opt count      -> ['optimizer']['opt_state'][0]['count'].value
     state_map = {
-        "['optimizer']['step'].value": ("step", None),
-        "['optimizer']['opt_state'][0]['count'].value": ("opt_states_0.no_prefix_0.count", None),
-        "['optimizer']['opt_state']['count'].value": ("opt_states_0.no_prefix_0.count", None),
+        "['step']": ("step", None),
+        "['opt_state']['count']": ("opt_states_0.no_prefix_0.count", None),
     }
   else:
     state_map = {
@@ -233,20 +226,12 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
   for keystr_maxtext, (keystr_pax, transform_fn) in keystr_map.items():
     prefix_pax_opt_state = get_layer_prefix(keystr_pax)
     if cfg.pure_nnx:
-      state_map[f"['model']{keystr_maxtext}.value"] = (f"mdl_vars{keystr_pax}", transform_fn)
-      state_map[f"['optimizer']['opt_state'][0]['mu']{keystr_maxtext}.value"] = (
+      state_map[f"['params']['params']{keystr_maxtext}"] = (f"mdl_vars{keystr_pax}", transform_fn)
+      state_map[f"['opt_state']['mu']['params']{keystr_maxtext}"] = (
           f"opt_states_0.{prefix_pax_opt_state}.m{keystr_pax}",
           transform_fn,
       )
-      state_map[f"['optimizer']['opt_state']['mu']{keystr_maxtext}.value"] = (
-          f"opt_states_0.{prefix_pax_opt_state}.m{keystr_pax}",
-          transform_fn,
-      )
-      state_map[f"['optimizer']['opt_state'][0]['nu']{keystr_maxtext}.value"] = (
-          f"opt_states_0.{prefix_pax_opt_state}.v{keystr_pax}",
-          transform_fn,
-      )
-      state_map[f"['optimizer']['opt_state']['nu']{keystr_maxtext}.value"] = (
+      state_map[f"['opt_state']['nu']['params']{keystr_maxtext}"] = (
           f"opt_states_0.{prefix_pax_opt_state}.v{keystr_pax}",
           transform_fn,
       )
@@ -263,7 +248,7 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
 
   def verify_fn(key_path, _):
     keystr = jax.tree_util.keystr(key_path)
-    if "['rngs']" in keystr:
+    if "['nnx_aux']" in keystr or "['rngs']" in keystr:
       return
     assert keystr in state_map, f"{keystr} not found"
 
@@ -275,7 +260,7 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
 
   def map_fn(key_path, value):
     key_path_str = jax.tree_util.keystr(key_path)
-    if "['rngs']" in key_path_str:
+    if "['nnx_aux']" in key_path_str or "['rngs']" in key_path_str:
       return value
     file_path, transform_fn = state_map[key_path_str]
     full_path = os.path.join(paxml_ckpt_prefix, file_path)
@@ -315,10 +300,8 @@ def convert(paxml_ckpt_path, maxtext_model_name, base_output_directory, run_name
   max_logging.log("converted state finished")
   max_utils.print_mem_stats("converted state finished")
 
-  step_value = int(converted_state.optimizer.step.value) if cfg.pure_nnx else converted_state.step
-  if cfg.pure_nnx:
-    converted_state = train_state_nnx.to_checkpoint_dict(converted_state)
-  if checkpointing.save_checkpoint(checkpoint_manager, step_value, converted_state):
+  step_value = int(converted_state["step"]) if isinstance(converted_state, dict) else int(converted_state.step)
+  if checkpointing.save_checkpoint(checkpoint_manager, step_value, converted_state, config=cfg):
     max_logging.log(f"saved a checkpoint at step {step_value}")
   # Upon preemption, exit when and only when all ongoing saves are complete.
   if checkpoint_manager.reached_preemption(step_value):

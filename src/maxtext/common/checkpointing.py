@@ -725,16 +725,10 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
     max_logging.log(f"Checkpoint for step {actual_step} already exists, skipping save.")
     return
 
-  if config.pure_nnx:
-    # Save in the Linen on-disk layout so pure_nnx and Linen checkpoints are interchangeable.
-    if config.enable_diloco:
-      # DiLoCoTrainState: persist the synchronized global model (outer params).
-      # The per-replica inner optimizer / outer-momentum state is not checkpointed.
-      step_value = state.step.get_value() if hasattr(state.step, "get_value") else state.step
-      state = train_state_nnx.to_linen_checkpoint_dict({"model": state.params, "optimizer": {"step": step_value}})
+  if config and config.pure_nnx and not isinstance(state, dict):
+    if isinstance(state, train_state_nnx.TrainStateNNX):
+      state = train_state_nnx.to_checkpoint_dict(nnx.state(state))
     else:
-      # rngs/dropout/batch-stats are packed under items/nnx_aux so the RNG/dropout
-      # stream continues across resumes instead of resetting to a base key.
       state = train_state_nnx.to_checkpoint_dict(state)
 
   try:
@@ -765,6 +759,21 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
 
 def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=None, force=False):
   """Wrapper for saving checkpoint."""
+  if config and config.pure_nnx and not isinstance(state, dict):
+    if isinstance(state, train_state_nnx.TrainStateNNX):
+      state = nnx.state(state)
+    if isinstance(state, nnx.State):
+      # Save in the Linen on-disk layout so pure_nnx and Linen checkpoints are interchangeable.
+      if config.enable_diloco:
+        # DiLoCoTrainState: persist the synchronized global model (outer params).
+        # The per-replica inner optimizer / outer-momentum state is not checkpointed.
+        step_value = state.step.get_value() if hasattr(state.step, "get_value") else state.step
+        state = train_state_nnx.to_linen_checkpoint_dict({"model": state.params, "optimizer": {"step": step_value}})
+      else:
+        # rngs/dropout/batch-stats are packed under items/nnx_aux so the RNG/dropout
+        # stream continues across resumes instead of resetting to a base key.
+        state = train_state_nnx.to_checkpoint_dict(state)
+
   if config and config.enable_checkpointing:
     if (
         force
