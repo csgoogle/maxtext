@@ -38,7 +38,9 @@ from maxtext.utils.model_creation_utils import (
     _align_checkpoint_to_model_shapes,
     _fix_restore_args_for_shape_mismatch,
     _fuse_moe_weights,
+    _legacy_linen_layers_to_nnx,
     _stored_shape_evenly_shardable,
+    _target_to_legacy_linen_layers,
     _zero_pad_axis,
 )
 from tests.utils.test_helpers import get_test_config_path
@@ -61,6 +63,33 @@ def _is_fake_meta(x):
 # Monkey-patch the module-level helper so our fake metadata is recognised.
 _orig_is_orbax = model_creation_utils._is_orbax_array_metadata  # pylint: disable=protected-access
 model_creation_utils._is_orbax_array_metadata = _is_fake_meta  # pylint: disable=protected-access
+
+
+class TestLegacyLinenLayerPaths(unittest.TestCase):
+
+  def test_round_trip_unscanned_layers(self):
+    target = {
+        "decoder": {
+            "layers_0": {"kernel": "layer-zero"},
+            "layers_1": {"kernel": "layer-one"},
+            "decoder_norm": {"scale": "norm"},
+        }
+    }
+    metadata = {
+        "decoder": {
+            "layers": {
+                "0": {"kernel": object()},
+                "1": {"kernel": object()},
+            },
+            "decoder_norm": {"scale": object()},
+        }
+    }
+
+    legacy = _target_to_legacy_linen_layers(target, metadata)
+
+    self.assertNotIn("layers_0", legacy["decoder"])
+    self.assertEqual(legacy["decoder"]["layers"]["0"]["kernel"], "layer-zero")
+    self.assertEqual(_legacy_linen_layers_to_nnx(legacy, target), target)
 
 
 def _make_restore_arg(global_shape):

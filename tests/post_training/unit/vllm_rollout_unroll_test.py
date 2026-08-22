@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from maxtext.integration.vllm.maxtext_vllm_rollout import (
+    _create_model_converter,
     MaxTextVllmSampler,
     MaxTextVllmRollout,
     prepare_direct_sync_additional_config,
@@ -49,6 +50,14 @@ class MockWeights:
 
 
 class MaxTextVllmSamplerConverterTest(unittest.TestCase):
+
+  def test_direct_gemma4_sync_does_not_use_hf_converter(self):
+    config = SimpleNamespace(rollout_tensor_parallelism=4)
+    self.assertIsNone(
+        _create_model_converter(
+            "gemma4-31b", config, mesh=None, use_hf_mapping=False
+        )
+    )
 
   @pytest.mark.cpu_only
   def test_converter_output_uses_temporary_identity_mappings(self):
@@ -256,6 +265,33 @@ class GemmaScannedWeightsUnrollTest(unittest.TestCase):
     self.assertIsInstance(list(decoder_dict.keys())[0], str)
     np.testing.assert_array_equal(decoder_dict["layers_0"]["mlp"]["wi_0"], np.array([[0], [0]]))
     np.testing.assert_array_equal(decoder_dict["layers_6"]["mlp"]["wi_0"], np.array([[6], [6]]))
+
+  def test_unrolls_current_gemma4_local_and_global_scans(self):
+    local = np.zeros((2, 2, 5, 1), dtype=np.float32)
+    global_layer = np.zeros((2, 2, 1), dtype=np.float32)
+    for repetition in range(2):
+      for slot in range(5):
+        local[:, repetition, slot, :] = repetition * 6 + slot
+      global_layer[:, repetition, :] = repetition * 6 + 5
+    weights = MockWeights({
+        "base": {
+            "decoder": {
+                "scanned_blocks": {
+                    "local_layers": {"probe": local},
+                    "global_layer": {"probe": global_layer},
+                }
+            }
+        }
+    })
+
+    decoder = unroll_gemma_scanned_weights(weights)["base"]["decoder"]
+
+    self.assertEqual(set(decoder), {f"layers_{i}" for i in range(12)})
+    for layer_idx in range(12):
+      np.testing.assert_array_equal(
+          decoder[f"layers_{layer_idx}"]["probe"],
+          np.full((2, 1), layer_idx, dtype=np.float32),
+      )
 
 
 class QwenScannedWeightsUnrollTest(unittest.TestCase):

@@ -34,6 +34,7 @@ from collections.abc import Sequence
 import dataclasses
 from functools import partial
 import os
+import re
 import subprocess
 import sys
 from typing import Any, Callable, overload
@@ -76,6 +77,45 @@ _VLLM_REPEAT_AXES = frozenset({"kv_heads", ("expert", "model")})
 # (e.g. MoE MLP-dim padding to satisfy the GMM_v2 kernel's per-shard size
 # constraint, set in src/maxtext/integration/vllm/maxtext_vllm_adapter/adapter.py).
 _VLLM_ZERO_PAD_AXES = frozenset({"mlp_moe", "activation_mlp", ("attn_dp", "model")})
+
+
+_UNSCANNED_LAYER_KEY = re.compile(r"^layers_(\d+)$")
+
+
+def _target_to_legacy_linen_layers(target, metadata_tree):
+  """Match NNX ``layers_N`` targets to legacy Linen ``layers/N`` paths."""
+  if not hasattr(target, "items") or not hasattr(metadata_tree, "items"):
+    return target
+
+  converted = {}
+  legacy_layers = metadata_tree.get("layers")
+  layer_targets = {}
+  for key, value in target.items():
+    match = _UNSCANNED_LAYER_KEY.fullmatch(str(key))
+    if match and hasattr(legacy_layers, "items") and match.group(1) in legacy_layers:
+      index = match.group(1)
+      layer_targets[index] = _target_to_legacy_linen_layers(value, legacy_layers[index])
+      continue
+    converted[key] = _target_to_legacy_linen_layers(value, metadata_tree.get(key, {}))
+  if layer_targets:
+    converted["layers"] = layer_targets
+  return converted
+
+
+def _legacy_linen_layers_to_nnx(checkpoint, model_tree):
+  """Expand legacy Linen ``layers/N`` values back to NNX ``layers_N``."""
+  if not hasattr(checkpoint, "items") or not hasattr(model_tree, "items"):
+    return checkpoint
+
+  converted = {}
+  legacy_layers = checkpoint.get("layers")
+  for key, model_value in model_tree.items():
+    match = _UNSCANNED_LAYER_KEY.fullmatch(str(key))
+    if match and hasattr(legacy_layers, "items") and match.group(1) in legacy_layers:
+      converted[key] = _legacy_linen_layers_to_nnx(legacy_layers[match.group(1)], model_value)
+    elif key in checkpoint:
+      converted[key] = _legacy_linen_layers_to_nnx(checkpoint[key], model_value)
+  return converted
 
 
 def _normalize_logical_axes(axes):
@@ -1025,6 +1065,14 @@ def from_pretrained(
             is_leaf=lambda n: isinstance(n, nnx.Variable),
         )
 
+        # Older Linen checkpoints save unscanned layers as
+        # ``decoder/layers/<index>``. Current NNX models expose the same
+        # parameters as ``decoder/layers_<index>``. Present Orbax with the
+        # on-disk tree here, then convert it back after restore.
+        target_for_restore = _target_to_legacy_linen_layers(
+            target_for_restore, metadata.item_metadata.tree["params"]["params"]
+        )
+
         target_for_restore = _adjust_target_for_moe_fusion(
             target_for_restore, metadata.item_metadata.tree["params"]["params"], False
         )
@@ -1169,6 +1217,9 @@ def from_pretrained(
         model_arrays = to_dict(model_arrays)
         checkpoint = to_dict(checkpoint)
         logical_axes_tree = to_dict(logical_axes_tree)
+
+        if not is_nnx_checkpoint:
+          checkpoint = _legacy_linen_layers_to_nnx(checkpoint, model_arrays)
 
         checkpoint = _fuse_moe_weights(checkpoint, model_arrays)
         # Release the raw restored buffers now that wi_0/wi_1 have been fused (if needed).

@@ -116,9 +116,9 @@ def _create_model_converter(
   """Instantiate the converter for a MaxText model name."""
   tp = config.rollout_tensor_parallelism
   if not use_hf_mapping and not use_weight_converter:
-    # Default MaxText-to-MaxText sync uses legacy transfer_state_directly unless explicitly opted in
-    if model_name.startswith("gemma4"):
-      return Gemma4MaxTextToVLLMConverter(config=config, mesh=mesh)
+    # MaxTextForCausalLM has the same parameter semantics as the actor. Keep
+    # this path structural-only; the Gemma HF converter targets a different
+    # implementation and must never run for direct MaxText synchronization.
     return None
 
   rule_table = _rule_table_for(model_name)
@@ -399,6 +399,59 @@ def unroll_gemma_scanned_weights(weights):
 
   logging.debug("MaxTextVllmSampler: First 5 keys in flat_w: %s", list(flat_w.keys())[:5])
 
+  # Current Gemma 4 stores a five-local-plus-one-global attention cycle as
+  # ``scanned_blocks/local_layers`` (scan axis 1, slot axis 2) and
+  # ``scanned_blocks/global_layer`` (scan axis 1). The inference adapter uses
+  # one direct ``layers_N`` attribute per layer.
+  nested = []
+  scan_lengths = set()
+  local_slot_counts = set()
+  for key, value in flat_w.items():
+    if "dropout" in key or "rngs" in key or "scanned_blocks" not in key:
+      continue
+    container_idx = key.index("scanned_blocks")
+    if container_idx + 1 >= len(key) or key[container_idx + 1] not in ("local_layers", "global_layer"):
+      continue
+    kind = key[container_idx + 1]
+    if not hasattr(value, "shape") or len(value.shape) <= 1:
+      raise ValueError(f"Gemma 4 scanned parameter {'.'.join(map(str, key))} has no scan axis 1: {value!r}")
+    scan_lengths.add(value.shape[1])
+    if kind == "local_layers":
+      if len(value.shape) <= 2:
+        raise ValueError(f"Gemma 4 local parameter {'.'.join(map(str, key))} has no slot axis 2: {value!r}")
+      local_slot_counts.add(value.shape[2])
+    nested.append((key, value, container_idx, kind))
+
+  if nested:
+    if len(scan_lengths) != 1 or len(local_slot_counts) != 1:
+      raise ValueError(
+          "Gemma 4 nested scanned parameters disagree on scan/slot lengths: "
+          f"scan={sorted(scan_lengths)}, local_slots={sorted(local_slot_counts)}"
+      )
+    scan_length = scan_lengths.pop()
+    local_slots = local_slot_counts.pop()
+    nested_keys = {key for key, _, _, _ in nested}
+    new_flat_w = {key: value for key, value in flat_w.items() if key not in nested_keys}
+    for key, value, container_idx, kind in nested:
+      prefix = key[:container_idx]
+      suffix = key[container_idx + 2 :]
+      for repetition in range(scan_length):
+        if kind == "local_layers":
+          for slot in range(local_slots):
+            layer_idx = repetition * (local_slots + 1) + slot
+            new_flat_w[prefix + (f"layers_{layer_idx}",) + suffix] = jnp.take(
+                jnp.take(value, slot, axis=2), repetition, axis=1
+            )
+        else:
+          layer_idx = repetition * (local_slots + 1) + local_slots
+          new_flat_w[prefix + (f"layers_{layer_idx}",) + suffix] = jnp.take(value, repetition, axis=1)
+    logging.info(
+        "MaxTextVllmSampler: unrolled %d nested Gemma 4 tensor components across %d layers.",
+        len(nested_keys),
+        scan_length * (local_slots + 1),
+    )
+    return unflatten_dict(new_flat_w)
+
   # Check if this is actually a scanned Gemma 3/4 checkpoint
   is_gemma_scanned = any(_find_scanned_layer_idx(k)[0] != -1 for k in flat_w)
 
@@ -586,6 +639,10 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
     # fact indirectly and got it wrong when either field was reformatted.
     use_hf = "maxtext_config" not in vllm_additional_config and not uses_maxtext_vllm_adapter(maxtext_config)
     direct_maxtext_sync = not use_hf
+    if direct_maxtext_sync:
+      from maxtext.integration.vllm import maxtext_vllm_adapter  # pylint: disable=import-outside-toplevel
+
+      maxtext_vllm_adapter.register()
     use_weight_converter = bool(
         getattr(maxtext_config, "use_weight_converter", False)
         or vllm_additional_config.get("use_weight_converter", False)
@@ -608,7 +665,7 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
         debug=self._weight_sync_debug,
     )
 
-    if converter is not None:
+    if converter is not None or direct_maxtext_sync:
       mapping_config = mappings.MappingConfig()
     else:
       mapping_config = mappings.MappingConfig.build(
