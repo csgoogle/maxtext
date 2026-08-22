@@ -49,6 +49,28 @@ from maxtext.integration.vllm.torchax_converter.base import GREEN
 from maxtext.integration.vllm.torchax_converter.base import RESET
 
 
+def normalize_gemma4_scanned_blocks(blocks):
+  """Normalizes legacy per-slot and current nested Gemma4 scan layouts."""
+  if "layers_0" in blocks:
+    return blocks
+  if "local_layers" not in blocks or "global_layer" not in blocks:
+    raise ValueError(
+        "Unsupported Gemma4 scanned block layout; expected legacy layers_0 "
+        "or current local_layers/global_layer keys, found "
+        f"{sorted(blocks)}."
+    )
+
+  local_layers = blocks["local_layers"]
+  normalized = {
+      f"layers_{slot}": jax.tree.map(
+          lambda value: jnp.take(value, slot, axis=2), local_layers
+      )
+      for slot in range(Gemma4MaxTextToVLLMConverter.NUM_SLOTS - 1)
+  }
+  normalized["layers_5"] = blocks["global_layer"]
+  return normalized
+
+
 class Gemma4MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
   """Converts MaxText Gemma4 weights to the layout expected by a vLLM Gemma4 model."""
 
@@ -74,8 +96,10 @@ class Gemma4MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
         RESET,
     )
     self.vllm_state = {}
-    blocks = model_state["base"]["decoder"]["scanned_blocks"]
-    prefix = "vllm_model.language_model.model.layers"
+    blocks = normalize_gemma4_scanned_blocks(
+        model_state["base"]["decoder"]["scanned_blocks"]
+    )
+    prefix = "model.language_model.layers"
 
     with timer("Convert Global Weights"):
       self._convert_global(model_state)
@@ -108,21 +132,20 @@ class Gemma4MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
       return (x / normalizer).astype(x.dtype)
 
     raw_embedding = _denorm_embed(params["base"]["token_embedder"]["embedding"])
-    self.vllm_state["vllm_model.language_model.model.embed_tokens.weight"] = raw_embedding
-    self.vllm_state["vllm_model.language_model.lm_head.weight"] = raw_embedding  # tied
-    self.vllm_state["vllm_model.language_model.model.norm.weight"] = params["base"]["decoder"]["decoder_norm"]["scale"]
+    self.vllm_state["model.language_model.embed_tokens.weight"] = raw_embedding
+    self.vllm_state["model.language_model.norm.weight"] = params["base"]["decoder"]["decoder_norm"]["scale"]
     logging.info("_convert_global: done")
 
   def _convert_attn(self, params):
     """Satisfy abstract interface; Gemma4 uses _convert_attn_weights instead."""
     blocks = params["base"]["decoder"]["scanned_blocks"]
-    prefix = "vllm_model.language_model.model.layers"
+    prefix = "model.language_model.layers"
     self._convert_attn_weights(blocks, prefix)
 
   def _convert_moe(self, params):
     """Satisfy abstract interface; Gemma4 uses _convert_moe_weights/_convert_dense_mlp_weights."""
     blocks = params["base"]["decoder"]["scanned_blocks"]
-    prefix = "vllm_model.language_model.model.layers"
+    prefix = "model.language_model.layers"
     if self.is_moe:
       self._convert_moe_weights(blocks, prefix)
     else:
@@ -133,20 +156,24 @@ class Gemma4MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
   @staticmethod
   @jax.jit
   def _pack_attn(q, k, v, o, qnorm, knorm):
-    """Prepares separate q/k/v, o, and norms for all layers in a slot.
+    """Prepares native JAX-vLLM attention kernels for a scanned slot.
 
     Input shapes (MaxText scanned, scan axis at index 1):
       q/k/v: (d_model, L, nH, D)
       o:     (nH, L, D, d_model)   # scan axis is 1
       norms: (d_model, L)
-    Returns: L × (nH*D, d_model) for q/k/v, L × (d_model, nH*D) for o.
+    Returns:
+      q/k/v: L × (d_model, nH, D)
+      o: L × (nH, D, d_model)
+
+    TPU vLLM's Flax NNX Gemma4 implementation uses rank-3 ``JaxEinsum``
+    kernels. Keeping those logical dimensions intact also lets its named
+    sharding partition the head dimension directly for TP.
     """
-    # q/k/v: (d_model, L, nH, D) -> (L, nH, D, d_model) -> (L, nH*D, d_model)
-    q = jnp.transpose(q, (1, 2, 3, 0)).reshape(q.shape[1], -1, q.shape[0])
-    k = jnp.transpose(k, (1, 2, 3, 0)).reshape(k.shape[1], -1, k.shape[0])
-    v = jnp.transpose(v, (1, 2, 3, 0)).reshape(v.shape[1], -1, v.shape[0])
-    # o: (nH, L, D, d_model) -> (L, d_model, nH, D) -> (L, d_model, nH*D)
-    o = jnp.transpose(o, (1, 3, 0, 2)).reshape(o.shape[1], o.shape[3], -1)
+    q = jnp.swapaxes(q, 0, 1)
+    k = jnp.swapaxes(k, 0, 1)
+    v = jnp.swapaxes(v, 0, 1)
+    o = jnp.swapaxes(o, 0, 1)
     # norms: (D, L) -> (L, D)
     qnorm = jnp.transpose(qnorm, (1, 0))
     knorm = jnp.transpose(knorm, (1, 0))
@@ -175,13 +202,15 @@ class Gemma4MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
       post_attn = _unstack_norm(slot_data["post_self_attention_norm"]["scale"])
       pre_ffw = _unstack_norm(slot_data["pre_ffw_norm"]["scale"])
       post_ffw = _unstack_norm(slot_data["post_ffw_norm"]["scale"])
+      layer_scalars = _unstack_norm(slot_data["layer_scalar"])
       for rep in range(self.num_reps):
         i = rep * self.NUM_SLOTS + slot
         self.vllm_state[f"{prefix}.{i}.input_layernorm.weight"] = pre_attn[rep]
         self.vllm_state[f"{prefix}.{i}.post_attention_layernorm.weight"] = post_attn[rep]
         self.vllm_state[f"{prefix}.{i}.pre_feedforward_layernorm.weight"] = pre_ffw[rep]
         self.vllm_state[f"{prefix}.{i}.post_feedforward_layernorm.weight"] = post_ffw[rep]
-      del pre_attn, post_attn, pre_ffw, post_ffw
+        self.vllm_state[f"{prefix}.{i}.layer_scalar"] = layer_scalars[rep]
+      del pre_attn, post_attn, pre_ffw, post_ffw, layer_scalars
     gc.collect()
 
   # --- 4. Per-layer attention weights ---
@@ -189,12 +218,13 @@ class Gemma4MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
   def _convert_attn_weights(self, blocks, prefix):
     """Converts separate q/k/v proj, o proj, q-norm, k-norm for all layers.
 
-    HF/vLLM Gemma4 uses separate projections (not fused QKV).  Global attention
-    layers (slot 5) have no 'value' tensor; vLLM sets v_proj = k_proj.
+    JAX-vLLM Gemma4 uses separate rank-3 projections (not fused QKV). Global
+    attention layers (slot 5) have no ``v_proj`` because ``attention_k_eq_v``
+    reuses the K projection directly.
 
-    Tensor transformations (MaxText → HF):
-      q/k/v kernel: (d_model, nH, D) → (nH*D, d_model)  [reshape then transpose]
-      out kernel:   (nH, D, d_model) → (d_model, nH*D)   [reshape then transpose]
+    Tensor transformations (MaxText → JAX-vLLM):
+      q/k/v kernel: (d_model, nH, D) → identity
+      out kernel:   (nH, D, d_model) → identity
       norms:        (D,)             → (D,)               [identity]
     """
 
@@ -231,24 +261,13 @@ class Gemma4MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
       attn = blocks[f"layers_{slot}"]["self_attention"]
       pack_fn = _pack_global if is_global else _pack_local
       q_layers, k_layers, v_layers, o_layers, qnorm_layers, knorm_layers = pack_fn(attn)
-      num_kv_heads = self.config.global_num_kv_heads if is_global else self.config.base_num_kv_heads
-      tp = min(self.vllm_tp, num_kv_heads)
       for rep in range(self.num_reps):
         i = rep * self.NUM_SLOTS + slot
         q, k, v = q_layers[rep], k_layers[rep], v_layers[rep]
-        # QKVParallelLinear (vLLM) expects TP-interleaved layout:
-        # [q_tp0, k_tp0, v_tp0, q_tp1, k_tp1, v_tp1, ...]
-        q_per_tp = q.shape[0] // tp
-        kv_per_tp = k.shape[0] // tp
-        qkv = jnp.concatenate(
-            [
-                q.reshape(tp, q_per_tp, q.shape[1]),
-                k.reshape(tp, kv_per_tp, k.shape[1]),
-                v.reshape(tp, kv_per_tp, v.shape[1]),
-            ],
-            axis=1,
-        ).reshape(-1, q.shape[1])
-        self.vllm_state[f"{prefix}.{i}.self_attn.qkv_proj.weight"] = qkv
+        self.vllm_state[f"{prefix}.{i}.self_attn.q_proj.weight"] = q
+        self.vllm_state[f"{prefix}.{i}.self_attn.k_proj.weight"] = k
+        if not is_global:
+          self.vllm_state[f"{prefix}.{i}.self_attn.v_proj.weight"] = v
         self.vllm_state[f"{prefix}.{i}.self_attn.o_proj.weight"] = o_layers[rep]
         self.vllm_state[f"{prefix}.{i}.self_attn.q_norm.weight"] = qnorm_layers[rep]
         self.vllm_state[f"{prefix}.{i}.self_attn.k_norm.weight"] = knorm_layers[rep]
@@ -387,16 +406,15 @@ class Gemma4MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
     """Converts gate/up/down projections for all layers (31B only).
 
     Tensor transformations:
-      wi_0 (gate): (d_model, L, d_mlp) → L × (d_mlp, d_model)
-      wi_1 (up):   (d_model, L, d_mlp) → L × (d_mlp, d_model)
-      wo  (down):  (d_mlp,  L, d_model) → L × (d_model, d_mlp)
+      wi_0/wi_1: (d_model, L, d_mlp) → L × (d_model, d_mlp)
+      wo:        (d_mlp, L, d_model) → L × (d_mlp, d_model)
     """
 
     @jax.jit
     def _pack_mlp(mlp):
-      gate = jnp.unstack(jnp.transpose(mlp["wi_0"]["kernel"], (1, 2, 0)), axis=0)
-      up = jnp.unstack(jnp.transpose(mlp["wi_1"]["kernel"], (1, 2, 0)), axis=0)
-      down = jnp.unstack(jnp.transpose(mlp["wo"]["kernel"], (1, 2, 0)), axis=0)
+      gate = jnp.unstack(jnp.swapaxes(mlp["wi_0"]["kernel"], 0, 1), axis=0)
+      up = jnp.unstack(jnp.swapaxes(mlp["wi_1"]["kernel"], 0, 1), axis=0)
+      down = jnp.unstack(jnp.swapaxes(mlp["wo"]["kernel"], 0, 1), axis=0)
       return gate, up, down
 
     for slot in range(self.NUM_SLOTS):
@@ -405,8 +423,9 @@ class Gemma4MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
       for rep in range(self.num_reps):
         i = rep * self.NUM_SLOTS + slot
         p = f"{prefix}.{i}"
-        self.vllm_state[f"{p}.mlp.gate_proj.weight"] = gate_layers[rep]
-        self.vllm_state[f"{p}.mlp.up_proj.weight"] = up_layers[rep]
+        gate, up = gate_layers[rep], up_layers[rep]
+        gate_up = jnp.concatenate([gate, up], axis=1)
+        self.vllm_state[f"{p}.mlp.gate_up_proj.weight"] = gate_up
         self.vllm_state[f"{p}.mlp.down_proj.weight"] = down_layers[rep]
       del gate_layers, up_layers, down_layers
       gc.collect()

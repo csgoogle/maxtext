@@ -462,6 +462,7 @@ class Transformer(nnx.Module):
       decoder_target_mask: jax.Array | None = None,
       kv_caches: list[jax.Array] | None = None,
       attention_metadata: dict[str, Any] | None = None,
+      skip_lm_head: bool = False,
   ):
     """Applies the Zero-1 FSDP wrapped Transformer model.
 
@@ -562,6 +563,7 @@ class Transformer(nnx.Module):
           kv_caches=kv_caches,
           attention_metadata=attention_metadata,
           deepstack_visual_embeds=deepstack_visual_embeds,
+          skip_lm_head=skip_lm_head,
       )  # pytype: disable=wrong-keyword-args
     else:
       logits, hidden_state, kv_caches = self.decoder(
@@ -615,5 +617,8 @@ class Transformer(nnx.Module):
     if self.config.attention in ("vllm_rpa", "vllm_batched_rpa"):
       # In vLLM, logits are computed separately after updating the KV cache.
       return hidden_state, kv_caches
+
+    if skip_lm_head:
+      return hidden_state
 
     return logits

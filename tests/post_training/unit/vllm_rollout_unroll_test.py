@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 from maxtext.integration.vllm.maxtext_vllm_rollout import (
+    MaxTextVllmSampler,
     MaxTextVllmRollout,
     prepare_direct_sync_additional_config,
     requires_maxtext_scanned_weight_unroll,
@@ -28,6 +29,10 @@ from maxtext.integration.vllm.maxtext_vllm_rollout import (
     unroll_qwen_scanned_weights,
     uses_maxtext_vllm_adapter,
     validate_direct_sync_layer_coverage,
+)
+from maxtext.integration.vllm.torchax_converter.gemma4_moe import (
+    Gemma4MaxTextToVLLMConverter,
+    normalize_gemma4_scanned_blocks,
 )
 
 pytestmark = pytest.mark.post_training
@@ -41,6 +46,79 @@ class MockWeights:
 
   def to_pure_dict(self):
     return self._pure_dict
+
+
+class MaxTextVllmSamplerConverterTest(unittest.TestCase):
+
+  @pytest.mark.cpu_only
+  def test_converter_output_uses_temporary_identity_mappings(self):
+    sampler = object.__new__(MaxTextVllmSampler)
+    sampler._converter = mock.MagicMock()
+    sampler._converter.convert.return_value = {
+        "vllm_model.language_model.model.norm.weight": np.ones((2,)),
+    }
+    sampler._direct_maxtext_sync = False
+    sampler.to_hf_key_mappings = {"old": ("mapping", None)}
+
+    def assert_converted(_self, weights, filter_types):
+      del filter_types
+      self.assertEqual(
+          list(weights), ["vllm_model.language_model.model.norm.weight"]
+      )
+      self.assertEqual(
+          _self.to_hf_key_mappings,
+          {
+              "vllm_model.language_model.model.norm.weight": (
+                  "vllm_model.language_model.model.norm.weight",
+                  None,
+              )
+          },
+      )
+
+    with mock.patch(
+        "tunix.generate.vllm_sampler.VllmSampler.update_params",
+        autospec=True,
+        side_effect=assert_converted,
+    ):
+      sampler.update_params(MockWeights({"base": {}}))
+
+    self.assertEqual(sampler.to_hf_key_mappings, {"old": ("mapping", None)})
+
+
+class Gemma4ConverterLayoutTest(unittest.TestCase):
+
+  @pytest.mark.cpu_only
+  def test_attention_pack_preserves_native_nnx_kernel_ranks(self):
+    q = np.arange(3 * 2 * 4 * 5).reshape(3, 2, 4, 5)
+    k = np.arange(3 * 2 * 1 * 5).reshape(3, 2, 1, 5)
+    v = k + 1
+    o = np.arange(4 * 2 * 5 * 3).reshape(4, 2, 5, 3)
+    qnorm = np.arange(5 * 2).reshape(5, 2)
+    knorm = qnorm + 1
+
+    packed = Gemma4MaxTextToVLLMConverter._pack_attn(
+        q, k, v, o, qnorm, knorm
+    )
+
+    self.assertEqual(packed[0][0].shape, (3, 4, 5))
+    self.assertEqual(packed[1][0].shape, (3, 1, 5))
+    self.assertEqual(packed[2][0].shape, (3, 1, 5))
+    self.assertEqual(packed[3][0].shape, (4, 5, 3))
+    self.assertEqual(packed[4][0].shape, (5,))
+    self.assertEqual(packed[5][0].shape, (5,))
+
+  @pytest.mark.cpu_only
+  def test_normalizes_nested_local_and_global_scans(self):
+    local = np.arange(2 * 3 * 5).reshape(2, 3, 5)
+    global_layer = np.arange(2 * 3).reshape(2, 3)
+    normalized = normalize_gemma4_scanned_blocks({
+        "local_layers": {"weight": local},
+        "global_layer": {"weight": global_layer},
+    })
+
+    self.assertEqual(sorted(normalized), [f"layers_{i}" for i in range(6)])
+    np.testing.assert_array_equal(normalized["layers_3"]["weight"], local[:, :, 3])
+    self.assertIs(normalized["layers_5"]["weight"], global_layer)
 
 
 class GemmaScannedWeightsUnrollTest(unittest.TestCase):

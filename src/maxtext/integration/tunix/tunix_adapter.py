@@ -108,6 +108,7 @@ class TunixMaxTextAdapter(nnx.Module):
       attention_mask: Optional[Array],  # [B, L, L] or None
       decoder_segment_ids: Optional[Array] = None,
       output_hidden_states: bool = False,  # ignored
+      skip_lm_head: bool = False,
   ) -> Tuple[Array, None]:
     """Forward compatible with Tunix Trainers default loss.
     Returns logits, None.
@@ -118,8 +119,18 @@ class TunixMaxTextAdapter(nnx.Module):
         decoder_input_tokens=input_tokens,
         decoder_positions=positions,
         decoder_segment_ids=decoder_segment_ids,
+        skip_lm_head=skip_lm_head,
     )
     return logits, None
+
+  def compute_final_logits(self, hidden_states: Array) -> Array:
+    """Projects hidden states in chunks for Tunix GRPO log-probability loss."""
+    return self.base.decoder.apply_output_head(
+        shared_embedding=self.base.token_embedder,
+        y=hidden_states,
+        deterministic=True,
+        model_mode=self.base.model_mode,
+    )
 
   def to_hf_mappings(self):
     if self.use_no_op_mappings:

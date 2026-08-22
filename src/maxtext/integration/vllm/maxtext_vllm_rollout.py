@@ -34,6 +34,7 @@ from typing import Any, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import multihost_utils
 from flax import nnx
 from flax.traverse_util import flatten_dict, unflatten_dict
 
@@ -51,6 +52,42 @@ from maxtext.integration.vllm.torchax_converter.gemma4_moe import Gemma4MaxTextT
 # Sentinel distinguishing "this model has no entry" from "this model has an
 # entry whose value is None", which means direct-sync-only.
 _NO_RULE_TABLE = object()
+
+
+def localize_and_reshard_pytree(source: Any, target: Any, **_: Any) -> Any:
+  """Moves global trainer arrays into a controller's host-local rollout mesh.
+
+  A multi-controller JAX array sharded over all hosts is not fully addressable
+  by either Python process. vLLM's in-process TPU executor, conversely, owns a
+  host-local mesh. Reconstruct each logical tensor on both hosts through a
+  process collective, then place it with the destination's local sharding.
+  Processing happens one leaf at a time, bounding host memory by the largest
+  parameter rather than the full model.
+  """
+
+  def _move(value: Any, destination: Any) -> Any:
+    if isinstance(value, jax.Array) and not value.is_fully_addressable:
+      value = multihost_utils.process_allgather(value, tiled=True)
+    # A previous rollout phase may have parked vLLM's destination tree in
+    # pinned host memory. Weight sync always wakes it back onto TPU HBM.
+    if isinstance(destination, jax.sharding.Sharding):
+      destination = destination.with_memory_kind("device")
+    return jax.device_put(value, destination)
+
+  return jax.tree.map(_move, source, target)
+
+
+class _ConfigOverlay:
+  """Read-only attribute overlay for adapting external launcher configs."""
+
+  def __init__(self, base: Any, **overrides: Any):
+    self._base = base
+    self._overrides = overrides
+
+  def __getattr__(self, name: str) -> Any:
+    if name in self._overrides:
+      return self._overrides[name]
+    return getattr(self._base, name)
 
 
 def _rule_table_for(model_name: str):
@@ -461,7 +498,18 @@ class MaxTextVllmSampler(VllmSampler):
       filter_types: Optional[Tuple[Any, ...]] = None,
   ):
     """Update the vLLM runner weights from a MaxText state tree."""
-    if self._converter is None:
+    original_mappings = self.to_hf_key_mappings
+    if self._converter is not None:
+      if hasattr(updated_weights, "to_pure_dict"):
+        updated_weights = updated_weights.to_pure_dict()
+      updated_weights = self._converter.convert(updated_weights)
+      # The model-specific converter emits tensors under their exact vLLM
+      # state paths. Use identity mappings so Tunix performs resharding and
+      # assignment while retaining its KV-cache synchronization lifecycle.
+      self.to_hf_key_mappings = {
+          key: (key, None) for key in updated_weights
+      }
+    else:
       if self._direct_maxtext_sync:
         updated_weights = unroll_qwen_scanned_weights(
             updated_weights,
@@ -483,6 +531,8 @@ class MaxTextVllmSampler(VllmSampler):
         except Exception:  # pylint: disable=broad-except
           pass
       raise
+    finally:
+      self.to_hf_key_mappings = original_mappings
 
 
 class MaxTextVllmRollout(vllm_rollout.VllmRollout):
@@ -545,20 +595,27 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
     self._weight_sync_debug = bool(
         getattr(maxtext_config, "weight_sync_debug", False) or vllm_additional_config.get("weight_sync_debug", False)
     )
+    converter_config = _ConfigOverlay(
+        maxtext_config,
+        rollout_tensor_parallelism=rollout_config.tensor_parallel_size,
+    )
     converter = _create_model_converter(
         maxtext_config.model_name,
-        config=maxtext_config,
+        config=converter_config,
         mesh=mesh,
         use_hf_mapping=use_hf,
         use_weight_converter=use_weight_converter,
         debug=self._weight_sync_debug,
     )
 
-    mapping_config = mappings.MappingConfig.build(
-        mapping_obj=rollout_config.rollout_mapping_config,
-        model=rollout_actor,
-        backend="vllm_jax",
-    )
+    if converter is not None:
+      mapping_config = mappings.MappingConfig()
+    else:
+      mapping_config = mappings.MappingConfig.build(
+          mapping_obj=rollout_config.rollout_mapping_config,
+          model=rollout_actor,
+          backend="vllm_jax",
+      )
     engine_kwargs = {
         "max_model_len": cache_config_or_size,
         "model": rollout_config.rollout_vllm_model_version,
@@ -603,6 +660,7 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
             enable_dp_attention=rollout_config.rollout_vllm_enable_dp_attention,
             delete_dst_buffers=rollout_config.rollout_vllm_delete_dst_buffers,
             reshard_chunk_size=rollout_config.rollout_vllm_reshard_chunk_size,
+            reshard_fn=localize_and_reshard_pytree,
             engine_kwargs=engine_kwargs,
             additional_config=rollout_additional_config,
             sampling_kwargs=rollout_config.rollout_vllm_sampling_kwargs,

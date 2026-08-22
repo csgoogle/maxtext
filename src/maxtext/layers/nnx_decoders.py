@@ -1590,6 +1590,7 @@ class NNXDecoder(nnx.Module):
       attention_metadata=None,
       deepstack_visual_embeds: None | list[jnp.ndarray] = None,
       multimodal_input: None | MultimodalInput = None,
+      skip_lm_head: bool = False,
   ):
     cfg = self.config
     assert decoder_input_tokens.ndim == 2  # [batch, len]
@@ -2001,7 +2002,11 @@ class NNXDecoder(nnx.Module):
       hidden_state = y
 
     # When invoking from vLLM with RPA attention, logit computation is deferred to a later stage.
-    if cfg.attention in ("vllm_rpa", "vllm_batched_rpa"):
+    if skip_lm_head:
+      logits = None
+
+    # When invoking from vLLM with RPA attention, logit computation is deferred to a later stage.
+    elif cfg.attention in ("vllm_rpa", "vllm_batched_rpa"):
       logits = None
 
     # When in the Indexer Dense Warm-up stage, skip the expensive output head projection
