@@ -2492,6 +2492,14 @@ class VLLM(BaseModel):
           "rather than data movement. Adds one barrier per sync."
       ),
   )
+  log_weight_sync_samples: bool = Field(
+      False,
+      description=(
+          "Log one scalar from every floating-point actor and rollout-state leaf "
+          "around each trainer-to-rollout sync. This is a low-overhead diagnostic "
+          "for non-finite weights and should normally remain disabled."
+      ),
+  )
   vllm_load_format: str = Field(
       "dummy",
       description="Weight load format for vLLM in converter validation. Options:'auto', 'dummy'.",

@@ -37,6 +37,7 @@ import jax.numpy as jnp
 from jax.experimental import multihost_utils
 from flax import nnx
 from flax.traverse_util import flatten_dict, unflatten_dict
+import numpy as np
 
 from tunix.generate import mappings
 from tunix.generate.vllm_sampler import VllmConfig, VllmSampler
@@ -763,8 +764,34 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
     if getattr(self, "_weight_sync_debug", False):
       self._log_sync_boundary(params)
 
+    if getattr(self._maxtext_config, "log_weight_sync_samples", False):
+      self._log_weight_samples("actor before sync", params)
+
     with self._timed_weight_sync("sync_weights"):
       super().update_params(params, filter_types)
+    if getattr(self._maxtext_config, "log_weight_sync_samples", False):
+      self._log_weight_samples("rollout after sync", self._sampler.transformer_state)
+
+  def _log_weight_samples(self, label: str, state: Any) -> None:
+    """Logs one scalar per floating-point leaf to catch NaN syncs cheaply."""
+    samples = []
+    for leaf in jax.tree_util.tree_leaves(state):
+      value = leaf.value if hasattr(leaf, "value") else leaf
+      if not hasattr(value, "dtype") or not jnp.issubdtype(value.dtype, jnp.inexact):
+        continue
+      samples.append(jnp.ravel(value)[0].astype(jnp.float32))
+    if not samples:
+      logging.warning("weight_sync_samples: %s has no floating-point leaves", label)
+      return
+    host_samples = np.asarray(jax.device_get(jnp.stack(samples)))
+    logging.info(
+        "weight_sync_samples: %s leaves=%d finite=%d min=%.6g max=%.6g",
+        label,
+        host_samples.size,
+        int(np.isfinite(host_samples).sum()),
+        float(np.nanmin(host_samples)),
+        float(np.nanmax(host_samples)),
+    )
 
   def _sync_path_name(self) -> str:
     """Which of the three sync implementations this rollout actually uses."""

@@ -1735,6 +1735,13 @@ class AttentionOp(nnx.Module):
       )
 
     devices_in_data_fsdp = self.mesh.shape.get("data", 1) * self.mesh.shape.get("fsdp", 1)
+    print(
+        f"[DEBUG tpu_flash_attention] query.shape={query.shape}"
+        f" key.shape={key.shape} value.shape={value.shape}"
+        f" mesh.shape={dict(self.mesh.shape)}"
+        f" devices_in_data_fsdp={devices_in_data_fsdp}",
+        flush=True,
+    )
     assert (query.shape[0] / devices_in_data_fsdp).is_integer(), (
         "Batch dimension should be shardable among the devices in data and fsdp"
         " axis"
