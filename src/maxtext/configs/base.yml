@@ -683,6 +683,14 @@ ici_autoregressive_parallelism: 1
 ici_pipeline_parallelism: 1
 ici_expert_parallelism: 1
 
+# Attention heads are atomic, so a layer whose KV head count is smaller than the
+# KV-sharding degree cannot be split and is rejected. With this enabled, such a
+# layer replicates its KV projection instead of failing the whole mesh. Only the
+# indivisible layers are affected. Needed by mixed-attention models whose layers
+# disagree on head count -- Gemma 4 has sixteen KV heads on its sliding layers
+# and four on its global ones, so above TP=4 only the global layers replicate.
+replicate_indivisible_kv_heads: False
+
 # Enabling check_vma is recommended for improved performance. Only supported for EP / FSDP ICI parallelisms, shard_mode: "auto", use_ragged_sort: False, use_ring_of_experts: False, and use_tokamax_gmm=False.
 check_vma: False
 

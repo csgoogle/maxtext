@@ -5178,6 +5178,27 @@ class KVHeadShardingTest(parameterized.TestCase):
     with self._use_ulysses():
       self.attention._validate_kv_head_sharding(self._KV_KERNEL_AXES)  # pylint: disable=protected-access
 
+  def _replicate_indivisible(self):
+    """Turns on the replication escape hatch for an indivisible head count."""
+    return mock.patch.dict(
+        self.attention.config.get_keys(),
+        {"replicate_indivisible_kv_heads": True},
+    )
+
+  def test_indivisible_kv_heads_replicated_when_enabled(self):
+    """Rather than reject the mesh, drop `kv_heads` so the projection replicates."""
+    self._set_mesh_shape(tensor=4)
+    with self._replicate_indivisible():
+      key = self.attention.init_kv_w(inputs_kv_shape=self.inputs_kv_shape)
+    self.assertEqual(key.kernel_axes, ("embed", None, "kv_head_dim"))
+
+  def test_divisible_kv_heads_still_sharded_when_enabled(self):
+    """The escape hatch only fires for layers that cannot split their heads."""
+    self._set_mesh_shape(tensor=2)
+    with self._replicate_indivisible():
+      key = self.attention.init_kv_w(inputs_kv_shape=self.inputs_kv_shape)
+    self.assertEqual(key.kernel_axes, self._KV_KERNEL_AXES)
+
 
 if __name__ == "__main__":
   unittest.main()

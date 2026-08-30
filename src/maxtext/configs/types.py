@@ -1256,6 +1256,16 @@ class IciParallelism(BaseModel):
   ici_autoregressive_parallelism: int = Field(1, description="ICI axis for autoregressive parallelism.")
   ici_pipeline_parallelism: int = Field(1, description="ICI axis for pipeline parallelism.")
   ici_expert_parallelism: int = Field(1, description="ICI axis for expert parallelism.")
+  replicate_indivisible_kv_heads: bool = Field(
+      False,
+      description=(
+          "Replicate a layer's KV projection when its KV head count is not"
+          " divisible by the KV sharding degree, instead of rejecting the mesh."
+          " Only the indivisible layers are affected. Needed by mixed-attention"
+          " models such as Gemma 4, whose global layers carry four KV heads"
+          " while its sliding layers carry sixteen."
+      ),
+  )
 
 
 class PipelineParallelism(BaseModel):

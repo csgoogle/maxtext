@@ -53,6 +53,7 @@ from maxtext.common.common_types import (
 )
 from maxtext.layers import nnx_wrappers
 from maxtext.layers.attention_op import AttentionOp, _resolve_attention_type
+from maxtext.utils import max_logging
 from maxtext.layers.embeddings import (
     LLaMARotaryEmbedding,
     LlamaVisionRotaryEmbedding,
@@ -573,6 +574,47 @@ class Attention(nnx.Module):
     if self.num_query_heads % self.num_kv_heads != 0:
       raise ValueError("Invalid num_kv_heads for GQA.")
 
+  def _kv_head_shard_count(
+      self,
+      kernel_axes: Tuple[Optional[str], ...],
+  ) -> Optional[int]:
+    """Returns how many ways the `kv_heads` axis of a KV kernel is split.
+
+    Returns None when the kernel does not carry a `kv_heads` axis at all, i.e.
+    the projection is replicated and the head count is unconstrained.
+
+    Args:
+      kernel_axes: Logical axis names of the key/value projection kernel.
+    """
+    if "kv_heads" not in kernel_axes:
+      return None
+
+    # Size-one mesh axes are already dropped, so this is the exact shard count.
+    # An empty result means no logical rule shards the heads; that is not an
+    # early exit, because Ulysses below can still shard them over the context
+    # axis. An unsharded head dimension just leaves `kv_parallelism` at 1.
+    kv_heads_index = kernel_axes.index("kv_heads")
+    kv_head_axes = self._logical_to_mesh_axes(kernel_axes)[kv_heads_index]
+    if kv_head_axes is None:
+      kv_head_axes = ()
+    elif isinstance(kv_head_axes, str):
+      kv_head_axes = (kv_head_axes,)
+    kv_head_axes = list(kv_head_axes)
+
+    # Ulysses exchanges sequence ownership for head ownership through an
+    # all-to-all, so the context axis shards KV heads too even though no
+    # logical rule says so.
+    if self.config.context_parallel_strategy.lower() == "ulysses":
+      ulysses_axis = self.config.context_sharding
+      if ulysses_axis not in kv_head_axes:
+        kv_head_axes.append(ulysses_axis)
+
+    kv_parallelism = 1
+    for axis in kv_head_axes:
+      kv_parallelism *= self.mesh.shape.get(axis, 1)
+    self._kv_head_axes = kv_head_axes
+    return kv_parallelism
+
   def _validate_kv_head_sharding(
       self,
       kernel_axes: Tuple[Optional[str], ...],
@@ -604,39 +646,17 @@ class Attention(nnx.Module):
     Raises:
       ValueError: If the KV heads cannot be split evenly across the mesh.
     """
-    if "kv_heads" not in kernel_axes:
+    kv_parallelism = self._kv_head_shard_count(kernel_axes)
+    if kv_parallelism is None:
       # The projection is replicated, so the head count is unconstrained.
       return
-
-    # Size-one mesh axes are already dropped, so this is the exact shard count.
-    # An empty result means no logical rule shards the heads; that is not an
-    # early exit, because Ulysses below can still shard them over the context
-    # axis. An unsharded head dimension just leaves `kv_parallelism` at 1.
-    kv_heads_index = kernel_axes.index("kv_heads")
-    kv_head_axes = self._logical_to_mesh_axes(kernel_axes)[kv_heads_index]
-    if kv_head_axes is None:
-      kv_head_axes = ()
-    elif isinstance(kv_head_axes, str):
-      kv_head_axes = (kv_head_axes,)
-    kv_head_axes = list(kv_head_axes)
-
-    # Ulysses exchanges sequence ownership for head ownership through an
-    # all-to-all, so the context axis shards KV heads too even though no
-    # logical rule says so.
-    if self.config.context_parallel_strategy.lower() == "ulysses":
-      ulysses_axis = self.config.context_sharding
-      if ulysses_axis not in kv_head_axes:
-        kv_head_axes.append(ulysses_axis)
-
-    kv_parallelism = 1
-    for axis in kv_head_axes:
-      kv_parallelism *= self.mesh.shape.get(axis, 1)
 
     if self.num_kv_heads % kv_parallelism != 0:
       raise ValueError(
           f"num_kv_heads ({self.num_kv_heads}) for {self.attention_type}"
           f" attention layers must be divisible by {kv_parallelism}, the"
-          f" combined size of the mesh axes {kv_head_axes} that shard KV heads."
+          f" combined size of the mesh axes {self._kv_head_axes} that shard KV"
+          " heads."
           " Attention heads are atomic under tensor parallelism and cannot be"
           " split across more shards than there are heads. Either reduce the"
           " parallelism on those axes, raise the KV head count"
@@ -721,6 +741,30 @@ class Attention(nnx.Module):
         if self.config.ici_context_autoregressive_parallelism > 1
         else ("embed", "kv_heads", "kv_head_dim")
     )
+
+    # Heads are atomic, so a layer with fewer KV heads than shards cannot split
+    # them. Rather than reject the whole mesh, replicate just that layer's KV
+    # projection -- the case `_validate_kv_head_sharding` already documents as
+    # legal. Gemma 4 needs this: its ten global layers carry four KV heads
+    # while the fifty sliding layers carry sixteen, so at TP=8 the sliding
+    # layers still shard and only the global ones replicate. Without it the
+    # only alternatives are capping tensor parallelism at the smallest layer's
+    # head count or moving parallelism onto fsdp, both of which cost more than
+    # replicating one projection.
+    kv_parallelism = (
+        self._kv_head_shard_count(kernel_axes)
+        if getattr(self.config, "replicate_indivisible_kv_heads", False)
+        else None
+    )
+    if kv_parallelism is not None and self.num_kv_heads % kv_parallelism != 0:
+      max_logging.log(
+          f"num_kv_heads ({self.num_kv_heads}) for {self.attention_type} "
+          f"attention layers is not divisible by {kv_parallelism}, the combined "
+          f"size of the mesh axes {self._kv_head_axes} that shard KV heads; "
+          "replicating this layer's KV projection instead."
+      )
+      kernel_axes = ("embed", None, "kv_head_dim")
+
     self._validate_kv_head_sharding(kernel_axes)
 
     return DenseGeneral(

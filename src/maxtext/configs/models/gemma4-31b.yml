@@ -34,6 +34,13 @@ use_post_ffw_norm: true
 sliding_window_size: 1024
 share_kv_projections: true
 v_norm_with_scale: false
+# This model's layers disagree on KV head count: sixteen on the fifty sliding
+# layers, four on the ten global ones. Above TP=4 the global layers can no
+# longer split their heads, so without this the whole mesh is rejected even
+# though the sliding layers shard fine. Replicating just those ten layers'
+# KV projection is what makes the TP=8 rollout legal; the rollout must run
+# pure TP because any data axis trips vLLM into its DP scheduler.
+replicate_indivisible_kv_heads: True
 
 # RoPE scaling
 local_rope_max_timescale: 10000
