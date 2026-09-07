@@ -22,6 +22,7 @@ import pytest
 
 from maxtext.integration.vllm.maxtext_vllm_rollout import (
     _create_model_converter,
+    localize_and_reshard_pytree,
     MaxTextVllmSampler,
     MaxTextVllmRollout,
     prepare_direct_sync_additional_config,
@@ -49,7 +50,32 @@ class MockWeights:
     return self._pure_dict
 
 
+class _PinnedHostArray(np.ndarray):
+  """NumPy-backed stand-in for a JAX array parked in pinned host memory."""
+
+  sharding = SimpleNamespace(memory_kind="pinned_host")
+
+  def __array_function__(self, func, types, args, kwargs):
+    if func is np.take:
+      raise AssertionError("convert pinned-host JAX arrays with np.asarray before np.take")
+    return super().__array_function__(func, types, args, kwargs)
+
+
 class MaxTextVllmSamplerConverterTest(unittest.TestCase):
+
+  @pytest.mark.cpu_only
+  def test_reshard_converts_pinned_host_source_before_device_put(self):
+    source = np.arange(4, dtype=np.float32).view(_PinnedHostArray)
+    destination = object()
+
+    with mock.patch(
+        "maxtext.integration.vllm.maxtext_vllm_rollout.jax.device_put",
+        side_effect=lambda value, _: value,
+    ) as device_put:
+      result = localize_and_reshard_pytree(source, destination)
+
+    self.assertIs(type(result), np.ndarray)
+    self.assertIs(type(device_put.call_args.args[0]), np.ndarray)
 
   def test_direct_gemma4_sync_does_not_use_hf_converter(self):
     config = SimpleNamespace(rollout_tensor_parallelism=4)
@@ -292,6 +318,32 @@ class GemmaScannedWeightsUnrollTest(unittest.TestCase):
           decoder[f"layers_{layer_idx}"]["probe"],
           np.full((2, 1), layer_idx, dtype=np.float32),
       )
+
+  @pytest.mark.cpu_only
+  def test_unrolls_pinned_host_scans_without_jax_gather(self):
+    local = np.arange(2 * 2 * 5, dtype=np.float32).reshape(2, 2, 5).view(_PinnedHostArray)
+    global_layer = np.arange(2 * 2, dtype=np.float32).reshape(2, 2).view(_PinnedHostArray)
+    weights = MockWeights(
+        {
+            "decoder": {
+                "scanned_blocks": {
+                    "local_layers": {"probe": local},
+                    "global_layer": {"probe": global_layer},
+                }
+            }
+        }
+    )
+
+    with mock.patch(
+        "maxtext.integration.vllm.maxtext_vllm_rollout.jnp.take",
+        side_effect=AssertionError("pinned-host values must not use jnp.take"),
+    ):
+      decoder = unroll_gemma_scanned_weights(weights)["decoder"]
+
+    np.testing.assert_array_equal(decoder["layers_0"]["probe"], local[:, 0, 0])
+    np.testing.assert_array_equal(decoder["layers_5"]["probe"], global_layer[:, 0])
+    np.testing.assert_array_equal(decoder["layers_6"]["probe"], local[:, 1, 0])
+    np.testing.assert_array_equal(decoder["layers_11"]["probe"], global_layer[:, 1])
 
 
 class QwenScannedWeightsUnrollTest(unittest.TestCase):

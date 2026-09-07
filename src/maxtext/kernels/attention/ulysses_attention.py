@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 
 from maxtext.common.common_types import MODEL_MODE_TRAIN
 from maxtext.utils import sharding
@@ -195,16 +196,72 @@ def validate_head_sharding(
         f"{attention_label} requires local query heads "
         f"({local_query_heads}) to be divisible by the Ulysses exchange size ({ulysses_size})."
     )
-  if local_kv_heads % ulysses_size != 0:
+  # The exchange splits the head axis U ways, so it needs local_kv_heads to be
+  # a multiple of U -- OR few enough heads that each can be replicated up to U.
+  # Gemma4-31B is the second case: its global layers carry 4 KV heads against
+  # 32 query heads, which pinned Ulysses at U=4 no matter how much the query
+  # heads could take, and forced context parallelism to buy its extra width
+  # from fsdp_transpose instead. `ulysses_all_to_all_kv` closes that gap by
+  # replicating KV heads up to exactly U before the exchange, which is why
+  # divisibility may now run in either direction here.
+  if local_kv_heads % ulysses_size != 0 and ulysses_size % local_kv_heads != 0:
     raise ValueError(
-        f"{attention_label} requires local KV heads "
-        f"({local_kv_heads}) to be divisible by the Ulysses exchange size ({ulysses_size})."
+        f"{attention_label} requires local KV heads ({local_kv_heads}) and the "
+        f"Ulysses exchange size ({ulysses_size}) to divide one another: either "
+        "the KV heads split across the exchange, or they replicate up to it."
     )
 
 
 def ulysses_all_to_all(tensor: Any, ulysses_axis: str):
   """Moves `[B, H, S/U, D]` to `[B, H/U, S, D]`."""
   return jax.lax.all_to_all(tensor, ulysses_axis, split_axis=1, concat_axis=2, tiled=True)
+
+
+def replicate_kv_heads_for_ulysses(tensor: Any, ulysses_size: int):
+  """Grows `[B, K, S/U, D]` to `[B, U, S/U, D]` when K < U, by repeating heads.
+
+  The exchange splits the head axis U ways, so K must be a multiple of U. Under
+  GQA it frequently is not: Gemma4-31B's global layers pair 32 query heads with
+  4 KV heads, so U was capped at 4 while the query heads would have supported
+  8 or 16.
+
+  Replication is exact, not an approximation. Write R = Q/K for the GQA ratio
+  and F = U/K for the repeat factor. After the exchange rank r owns query heads
+  [rQ/U, (r+1)Q/U), and query head h reads KV head h//R. Dividing that range by
+  R gives [r/F, (r+1)/F), an interval of length 1/F <= 1 that cannot straddle
+  an integer -- so every query head on rank r reads the *same* KV head, r//F.
+  Repeating each KV head F times puts exactly that head at position r of the
+  repeated axis, so the exchange hands rank r precisely the head its query
+  heads were always going to read. No rank gains or loses information: the
+  duplicated heads are the same head.
+
+  The cost is the duplication itself -- F copies of K and V ride the all-to-all
+  instead of one. For the 4-head global layers at U=8 that is 2x on a tensor
+  already 8x smaller than Q, and it buys a doubling of context parallelism.
+  """
+  heads = tensor.shape[1]
+  if heads >= ulysses_size:
+    # Already a multiple of U (the validator guarantees it); nothing to do.
+    return tensor
+  if ulysses_size % heads != 0:
+    raise ValueError(
+        f"cannot replicate {heads} KV heads up to a Ulysses exchange size of "
+        f"{ulysses_size}: the exchange size must be a multiple of the head "
+        "count for the mapping from query head to KV head to stay exact."
+    )
+  return jnp.repeat(tensor, ulysses_size // heads, axis=1)
+
+
+def ulysses_all_to_all_kv(tensor: Any, ulysses_axis: str, ulysses_size: int):
+  """Ulysses exchange for a K or V operand, replicating heads first if needed.
+
+  Use this for key/value and plain `ulysses_all_to_all` for query. Query heads
+  are never replicated: each is a distinct head whose output has to return
+  through `inverse_ulysses_all_to_all` in the layout it left in.
+  """
+  return ulysses_all_to_all(
+      replicate_kv_heads_for_ulysses(tensor, ulysses_size), ulysses_axis
+  )
 
 
 def inverse_ulysses_all_to_all(tensor: Any, ulysses_axis: str):

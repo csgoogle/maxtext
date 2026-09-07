@@ -3142,10 +3142,16 @@ class MaxTextConfig(
       )
     if self.num_kv_heads == 1:
       raise ValueError("TPU USP attention does not support MQA with ici_context_usp_ulysses_parallelism > 1.")
-    if self.num_kv_heads % usp_ulysses_size != 0:
+    # Same rule as the pure-Ulysses path: split across the exchange, or
+    # replicate up to it. See _validate_context_parallelism.
+    if (
+        self.num_kv_heads % usp_ulysses_size != 0
+        and usp_ulysses_size % self.num_kv_heads != 0
+    ):
       raise ValueError(
           "TPU USP attention requires num_kv_heads "
-          f"({self.num_kv_heads}) to be divisible by ici_context_usp_ulysses_parallelism ({usp_ulysses_size})."
+          f"({self.num_kv_heads}) and ici_context_usp_ulysses_parallelism "
+          f"({usp_ulysses_size}) to divide one another."
       )
 
   def validate_num_moe_emb_chunks(self):
@@ -4108,8 +4114,8 @@ class MaxTextConfig(
         raise ValueError("TPU Ulysses attention requires use_jax_splash=False.")
       if self.use_indexer:
         raise ValueError("TPU Ulysses attention does not support sparse indexer masks.")
-      if self.attention_type != "global":
-        raise ValueError("TPU Ulysses attention is initially supported only for global causal attention.")
+      if self.attention_type not in ("global", "local_sliding"):
+        raise ValueError("TPU Ulysses attention supports only attention_type='global' or 'local_sliding'.")
       if self.context_parallel_load_balance:
         raise ValueError(
             "TPU Ulysses attention requires context_parallel_load_balance=False: after the all-to-all every device "
@@ -4142,10 +4148,20 @@ class MaxTextConfig(
         )
       if self.num_kv_heads == 1:
         raise ValueError("TPU Ulysses attention does not support MQA with context_parallel_size > 1.")
-      if self.num_kv_heads % context_parallel_size != 0:
+      # Either the KV heads split across the exchange, or they replicate up to
+      # it: ulysses_all_to_all_kv repeats each head context_parallel_size //
+      # num_kv_heads times before the all-to-all, which is exact (and produces
+      # bit-identical gradients) whenever the two divide one another. Without
+      # the second branch Gemma4-31B's 4 global KV heads capped context
+      # parallelism at 4 regardless of its 32 query heads.
+      if (
+          self.num_kv_heads % context_parallel_size != 0
+          and context_parallel_size % self.num_kv_heads != 0
+      ):
         raise ValueError(
             "TPU Ulysses attention requires num_kv_heads "
-            f"({self.num_kv_heads}) to be divisible by context_parallel_size ({context_parallel_size})."
+            f"({self.num_kv_heads}) and context_parallel_size "
+            f"({context_parallel_size}) to divide one another."
         )
     self._validate_usp_context_parallelism()
     # STRIPED reorder strategy is a Transformer Engine feature and is GPU-only.

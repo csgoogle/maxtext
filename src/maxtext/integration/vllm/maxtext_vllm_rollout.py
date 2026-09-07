@@ -69,6 +69,12 @@ def localize_and_reshard_pytree(source: Any, target: Any, **_: Any) -> Any:
   def _move(value: Any, destination: Any) -> Any:
     if isinstance(value, jax.Array) and not value.is_fully_addressable:
       value = multihost_utils.process_allgather(value, tiled=True)
+    # JAX cannot directly reorder a pinned-host PjRtBuffer into a device
+    # sharding. Materialize only this host-resident leaf as NumPy first; the
+    # tree map keeps the transfer leaf-at-a-time and device arrays stay on the
+    # existing direct path.
+    if getattr(getattr(value, "sharding", None), "memory_kind", None) == "pinned_host":
+      value = np.asarray(value)
     # A previous rollout phase may have parked vLLM's destination tree in
     # pinned host memory. Weight sync always wakes it back onto TPU HBM.
     if isinstance(destination, jax.sharding.Sharding):
@@ -440,12 +446,19 @@ def unroll_gemma_scanned_weights(weights):
         if kind == "local_layers":
           for slot in range(local_slots):
             layer_idx = repetition * (local_slots + 1) + slot
-            new_flat_w[prefix + (f"layers_{layer_idx}",) + suffix] = jnp.take(
-                jnp.take(value, slot, axis=2), repetition, axis=1
-            )
+            if getattr(getattr(value, "sharding", None), "memory_kind", None) == "pinned_host":
+              host_value = np.asarray(value)
+              layer_value = np.take(np.take(host_value, slot, axis=2), repetition, axis=1)
+            else:
+              layer_value = jnp.take(jnp.take(value, slot, axis=2), repetition, axis=1)
+            new_flat_w[prefix + (f"layers_{layer_idx}",) + suffix] = layer_value
         else:
           layer_idx = repetition * (local_slots + 1) + local_slots
-          new_flat_w[prefix + (f"layers_{layer_idx}",) + suffix] = jnp.take(value, repetition, axis=1)
+          if getattr(getattr(value, "sharding", None), "memory_kind", None) == "pinned_host":
+            layer_value = np.take(np.asarray(value), repetition, axis=1)
+          else:
+            layer_value = jnp.take(value, repetition, axis=1)
+          new_flat_w[prefix + (f"layers_{layer_idx}",) + suffix] = layer_value
     logging.info(
         "MaxTextVllmSampler: unrolled %d nested Gemma 4 tensor components across %d layers.",
         len(nested_keys),

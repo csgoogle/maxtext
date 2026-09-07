@@ -669,8 +669,11 @@ class AttentionOp(nnx.Module):
         raise ValueError("TPU Ulysses attention requires use_tokamax_splash=True.")
       if self.config.use_jax_splash:
         raise ValueError("TPU Ulysses attention requires use_jax_splash=False.")
-      if self.attention_type != AttentionType.GLOBAL:
-        raise ValueError("TPU Ulysses attention is initially supported only for global causal attention.")
+      # Sliding-window layers are fine here, unlike under ring: the all-to-all
+      # hands every device the full sequence in natural order, so the window
+      # mask is the ordinary single-device mask with no offset bookkeeping.
+      if self.attention_type not in (AttentionType.GLOBAL, AttentionType.LOCAL_SLIDING):
+        raise ValueError("TPU Ulysses attention supports only attention_type='global' or 'local_sliding'.")
       if self.config.enable_dropout and self.dropout_rate > 0.0:
         raise ValueError("TPU Ulysses attention does not support dropout yet.")
       if self.use_ragged_attention:
@@ -1727,6 +1730,9 @@ class AttentionOp(nnx.Module):
     elif use_usp:
       ring_axis = self.config.context_sharding
       ulysses_axis = self.config.ulysses_context_sharding
+      # Under USP the Ulysses exchange runs on its own axis, not the ring axis
+      # cp_size measures, so its size has to be read separately.
+      usp_ulysses_size = self.mesh.shape.get(ulysses_axis, 1)
       axis_names_kv = usp_attention.with_usp_sequence_axes(
           axis_names_kv,
           ring_axis,
@@ -1819,6 +1825,17 @@ class AttentionOp(nnx.Module):
         sa_config = dataclasses.replace(sa_config, max_logit_const=self.config.use_max_logit_estimate)
       mask_shape = (query.shape[2], key.shape[2])  # (q_seq_len, kv_seq_len)
       mask = tokamax_splash_mask.CausalMask(shape=mask_shape)
+      if self.attention_type == AttentionType.LOCAL_SLIDING:
+        if self.sliding_window_size is None:
+          raise ValueError("Sliding_window_size must be set if Local Sliding attention type")
+        # Plain LocalMask, not the LoadBalanced variant: Ulysses rejects
+        # context_parallel_load_balance, so the sequence is never reordered and
+        # the window sits at offset 0 over the full (q_seq_len, kv_seq_len).
+        mask &= tokamax_splash_mask.LocalMask(
+            shape=mask_shape,
+            window_size=(self.sliding_window_size - 1, self.sliding_window_size),
+            offset=0,
+        )
 
       @partial(
           jax.jit,
@@ -2046,9 +2063,13 @@ class AttentionOp(nnx.Module):
         return attention_output, None
 
       if use_ulysses:
+        # cp_size is mesh.shape[context_sharding] and Ulysses exchanges over
+        # that same axis, so cp_size *is* the exchange size U. K/V take the
+        # KV-aware exchange, which replicates heads up to U when GQA supplies
+        # fewer than U of them; Q never replicates.
         query = ulysses_attention.ulysses_all_to_all(query, context_axis)
-        key = ulysses_attention.ulysses_all_to_all(key, context_axis)
-        value = ulysses_attention.ulysses_all_to_all(value, context_axis)
+        key = ulysses_attention.ulysses_all_to_all_kv(key, context_axis, cp_size)
+        value = ulysses_attention.ulysses_all_to_all_kv(value, context_axis, cp_size)
         if decoder_segment_ids_q is not None:
           # Q and KV segment IDs are the same tensor in this train-only
           # self-attention path, so one gather serves both kernel operands.
@@ -2079,6 +2100,7 @@ class AttentionOp(nnx.Module):
             decoder_segment_ids_q,
             splash_kernel,
             ulysses_axis,
+            usp_ulysses_size,
         )
         return attention_output, None
 

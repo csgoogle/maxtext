@@ -64,11 +64,14 @@ def call_usp_attention(
     decoder_segment_ids_q: Any,
     ring_kernel: Any,
     ulysses_axis: str,
+    ulysses_size: int,
 ):
   """Runs ring attention over the Ulysses-exchanged operands and restores the layout."""
+  # K/V replicate their heads up to the exchange size when GQA leaves fewer
+  # than one per rank; Q never does. Same rule as the pure-Ulysses path.
   query = ulysses_attention.ulysses_all_to_all(query, ulysses_axis)
-  key = ulysses_attention.ulysses_all_to_all(key, ulysses_axis)
-  value = ulysses_attention.ulysses_all_to_all(value, ulysses_axis)
+  key = ulysses_attention.ulysses_all_to_all_kv(key, ulysses_axis, ulysses_size)
+  value = ulysses_attention.ulysses_all_to_all_kv(value, ulysses_axis, ulysses_size)
   if decoder_segment_ids_q is not None:
     # One gather serves both ring operands; the result stays sequence-sharded
     # over the ring axis, the layout the ring kernel expects.
