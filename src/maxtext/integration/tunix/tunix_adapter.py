@@ -109,6 +109,7 @@ class TunixMaxTextAdapter(nnx.Module):
       decoder_segment_ids: Optional[Array] = None,
       output_hidden_states: bool = False,  # ignored
       skip_lm_head: bool = False,
+      forced_routed_experts: Optional[Array] = None,
   ) -> Tuple[Array, None]:
     """Forward compatible with Tunix Trainers default loss.
     Returns logits, None.
@@ -120,6 +121,7 @@ class TunixMaxTextAdapter(nnx.Module):
         decoder_positions=positions,
         decoder_segment_ids=decoder_segment_ids,
         skip_lm_head=skip_lm_head,
+        forced_routed_experts=forced_routed_experts,
     )
     return logits, None
 

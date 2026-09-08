@@ -15,6 +15,7 @@
 """Unit tests for MaxText scanned-weight unrolling workarounds."""
 
 from types import SimpleNamespace
+import sys
 import unittest
 from unittest import mock
 import numpy as np
@@ -601,8 +602,12 @@ class MaxTextVllmRolloutConfigForwardingTest(unittest.TestCase):
         rollout_tensor_parallelism=4,
     )
     fake_sampler = mock.MagicMock()
+    fake_adapter = mock.MagicMock()
 
     with (
+        mock.patch.dict(sys.modules, {
+            "maxtext.integration.vllm.maxtext_vllm_adapter": fake_adapter,
+        }),
         mock.patch(
             "maxtext.integration.vllm.maxtext_vllm_rollout.mappings.MappingConfig.build",
             return_value=object(),
@@ -626,6 +631,7 @@ class MaxTextVllmRolloutConfigForwardingTest(unittest.TestCase):
       )
 
     config = sampler_cls.call_args.kwargs["config"]
+    fake_adapter.register.assert_called_once_with()
     self.assertEqual(config.sampling_kwargs, sampling_kwargs)
     self.assertEqual(config.expert_parallel_size, 1)
     self.assertEqual(config.return_logprobs, True)
