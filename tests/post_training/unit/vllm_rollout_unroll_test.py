@@ -583,6 +583,7 @@ class MaxTextVllmRolloutConfigForwardingTest(unittest.TestCase):
         rollout_vllm_server_mode_submission_threshold=7,
         rollout_vllm_server_mode_submission_timeout_s=3.0,
         return_logprobs=True,
+        return_sampling_mask=True,
         tensor_parallel_size=4,
         data_parallel_size=2,
         expert_parallel_size=1,
@@ -615,6 +616,7 @@ class MaxTextVllmRolloutConfigForwardingTest(unittest.TestCase):
             "maxtext.integration.vllm.maxtext_vllm_rollout.MaxTextVllmSampler",
             return_value=fake_sampler,
         ) as sampler_cls,
+        mock.patch("maxtext.integration.vllm.maxtext_vllm_rollout._allow_tpu_sampling_mask") as allow_mask,
         mock.patch("maxtext.integration.vllm.maxtext_vllm_rollout.nnx.state", return_value={"base": {}}),
     ):
       MaxTextVllmRollout(
@@ -629,6 +631,8 @@ class MaxTextVllmRolloutConfigForwardingTest(unittest.TestCase):
     self.assertEqual(config.sampling_kwargs, sampling_kwargs)
     self.assertEqual(config.expert_parallel_size, 1)
     self.assertEqual(config.return_logprobs, True)
+    self.assertEqual(config.return_sampling_mask, True)
+    allow_mask.assert_called_once_with()
     self.assertEqual(config.reshard_chunk_size, 8)
     self.assertEqual(config.server_mode_submission_threshold, 7)
     self.assertEqual(config.server_mode_submission_timeout_s, 3.0)

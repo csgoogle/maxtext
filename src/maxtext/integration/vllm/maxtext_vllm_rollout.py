@@ -55,6 +55,28 @@ from maxtext.integration.vllm.torchax_converter.gemma4_moe import Gemma4MaxTextT
 _NO_RULE_TABLE = object()
 
 
+def _allow_tpu_sampling_mask() -> None:
+  """Allow the TPU runner's mask producer past vLLM's CUDA V2 check."""
+  from vllm.config import vllm as vllm_config  # pylint: disable=import-outside-toplevel
+
+  def verify(config) -> None:
+    model_config = config.model_config
+    if model_config is None or not model_config.return_sampling_mask:
+      return
+    if config.speculative_config is not None:
+      raise ValueError("sampling distribution replay does not support speculative decoding")
+    if model_config.is_diffusion:
+      raise ValueError("sampling distribution replay does not support diffusion models")
+    if model_config.logits_processors:
+      raise ValueError("sampling distribution replay does not support custom logits processors")
+    if model_config.logprobs_mode != "processed_logprobs":
+      raise ValueError(
+          "sampling distribution replay requires logprobs_mode='processed_logprobs'"
+      )
+
+  vllm_config.VllmConfig._verify_sampling_replay_config = verify  # pylint: disable=protected-access
+
+
 def localize_and_reshard_pytree(source: Any, target: Any, **_: Any) -> Any:
   """Moves global trainer arrays into a controller's host-local rollout mesh.
 
@@ -712,6 +734,9 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
     )
     self._maxtext_config = maxtext_config
 
+    if rollout_config.return_sampling_mask:
+      _allow_tpu_sampling_mask()
+
     self._sampler = MaxTextVllmSampler(
         tokenizer=tokenizer,
         config=VllmConfig(  # pylint: disable=unexpected-keyword-arg,no-value-for-parameter
@@ -725,6 +750,7 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
             server_mode_submission_threshold=rollout_config.rollout_vllm_server_mode_submission_threshold,
             server_mode_submission_timeout_s=rollout_config.rollout_vllm_server_mode_submission_timeout_s,
             return_logprobs=rollout_config.return_logprobs,
+            return_sampling_mask=rollout_config.return_sampling_mask,
             tensor_parallel_size=rollout_config.tensor_parallel_size,
             data_parallel_size=rollout_config.data_parallel_size,
             expert_parallel_size=rollout_config.expert_parallel_size,

@@ -969,7 +969,22 @@ def from_pretrained(
   specs = nnx.get_partition_spec(_abs_state_for_specs)
 
   if config.pure_nnx:
-    model = maxtext_utils_nnx.create_nnx_sharded_model(abstract_model, _create_model, mesh=mesh)
+    # The rules context is REQUIRED here, not defensive. create_nnx_sharded_model
+    # runs `_create_model` for real (inside its jit), so every module __init__
+    # re-runs outside the abstract trace above -- and `get_logical_axis_rules()`
+    # returns () when no context is open, which silently turns every logical
+    # axis into None. Both siblings already do this: create_nnx_abstract_model
+    # wraps its eval_shape and create_nnx_sharded_model_hybrid wraps its
+    # equivalent call; only the pure_nnx branch was missing it.
+    #
+    # Silent for every strategy that merely reads the resolved axes, because
+    # None just means replicated. Ulysses is the first thing that VALIDATES
+    # them -- AttentionOp.__init__ -> validate_ulysses_mesh_axis, which raised
+    # "requires Q sequence sharding to be exactly ('context',), got ()" while
+    # config.logical_axis_rules plainly mapped activation_length to
+    # ('context', 'context_usp_ulysses').
+    with nn.logical_axis_rules(config.logical_axis_rules):
+      model = maxtext_utils_nnx.create_nnx_sharded_model(abstract_model, _create_model, mesh=mesh)
     # TODO: print debug_sharding info
   else:
     model = create_nnx_sharded_model_hybrid(config, mesh, devices, model_mode, rng_key)
