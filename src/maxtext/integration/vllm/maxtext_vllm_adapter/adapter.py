@@ -46,6 +46,31 @@ from vllm.config import VllmConfig
 _HYBRID_LAYER_IMBALANCE_THRESHOLD = 1.5
 
 
+class _LayerIndexedKVCaches:
+  """Layer-indexed view over vLLM's per-buffer KV cache list.
+
+  With per-group KV (JAX_SLIDING_WINDOW_KV_CACHE=1) tpu_inference allocates one
+  buffer per (KVCacheTensor, shape), so several layers from different KV cache
+  groups share one buffer (their blocks are disjoint) and ``kv_caches`` is no
+  longer one entry per layer. The decoder indexes and writes back by layer
+  index, so route both through ``layer_name_to_kvcache_index``; writes to a
+  shared buffer are threaded through ``caches`` in layer order.
+  """
+
+  def __init__(self, caches, layer_to_cache):
+    self.caches = list(caches)
+    self.layer_to_cache = tuple(layer_to_cache)
+
+  def __len__(self):
+    return len(self.layer_to_cache)
+
+  def __getitem__(self, lyr):
+    return self.caches[self.layer_to_cache[lyr]]
+
+  def __setitem__(self, lyr, value):
+    self.caches[self.layer_to_cache[lyr]] = value
+
+
 def next_power_of_two(x: int) -> int:
   """Finds the smallest power of 2 >= x using bit manipulation.
 
@@ -244,6 +269,7 @@ class MaxTextForCausalLM(nnx.Module):
     # kv_cache_group so they share one block_tables. Pick a metadata from a
     # full-attn (non-linear_attention) layer when possible; otherwise any
     # value works.
+    kv_view = None
     if isinstance(attention_metadata, dict):
       hf_text_config = getattr(self.cfg, "hf_text_config", getattr(self.cfg, "hf_config", None))
       layer_types = getattr(hf_text_config, "layer_types", None) or []
@@ -255,13 +281,35 @@ class MaxTextForCausalLM(nnx.Module):
             break
       if attention_metadata_picked is None:
         attention_metadata_picked = next(iter(attention_metadata.values()))
-      attention_metadata = attention_metadata_picked
+      # Several attention KV cache groups (sliding-window KV specs,
+      # JAX_SLIDING_WINDOW_KV_CACHE=1): each group has its own block_tables,
+      # so every layer must get its own group's metadata and its own buffer.
+      # args[2] is tpu_inference's layer_name_to_kvcache_index.
+      num_groups = len({id(v) for v in attention_metadata.values()})
+      if num_groups > 1 and "linear_attention" not in layer_types:
+        cfg = self.maxtext_config
+        if cfg.scan_layers or not cfg.pure_nnx_decoder or getattr(cfg, "using_pipeline_parallelism", False):
+          raise NotImplementedError(
+              "Per-group KV cache metadata (JAX_SLIDING_WINDOW_KV_CACHE=1) needs "
+              "scan_layers=False, pure_nnx_decoder=True and no pipeline parallelism."
+          )
+        layer_to_cache = dict(args[2])
+        num_layers = cfg.num_decoder_layers
+        kv_view = _LayerIndexedKVCaches(kv_caches, [layer_to_cache[f"layer.{i}"] for i in range(num_layers)])
+        kv_caches = kv_view
+        positions_metadata = attention_metadata_picked
+        attention_metadata = tuple(
+            attention_metadata.get(f"layer.{i}", attention_metadata_picked) for i in range(num_layers)
+        )
+      else:
+        attention_metadata = attention_metadata_picked
+    positions_metadata = attention_metadata if kv_view is None else positions_metadata
 
     # MaxText decode treats vLLM's flattened tokens as a batch with seq_len=1.
     # MRoPE positions arrive channel-first and must also move their 3 channels
     # to MaxText's trailing dimension.
     input_ids = jnp.expand_dims(input_ids, axis=1)
-    input_positions = normalize_vllm_input_positions(attention_metadata.input_positions)
+    input_positions = normalize_vllm_input_positions(positions_metadata.input_positions)
 
     with self.mesh, nn.logical_axis_rules(self.maxtext_config.logical_axis_rules):
       aux_hidden_states = []
@@ -277,6 +325,8 @@ class MaxTextForCausalLM(nnx.Module):
 
       # To be compatible with vLLM, we reshape to (batch * seq, dim).
       hidden = hidden.reshape((-1, hidden.shape[-1]))
+      if kv_view is not None:
+        kv_caches = kv_view.caches
 
     return kv_caches, hidden, aux_hidden_states, expert_indices
 

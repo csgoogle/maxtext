@@ -1904,7 +1904,17 @@ class NNXDecoder(nnx.Module):
 
         checkpointed_fn = jax.checkpoint(pure_layer_fn, policy=policy, prevent_cse=prevent_cse)
 
+        # The vLLM adapter passes one AttentionMetadata per layer (a tuple) when
+        # the KV cache has several groups with their own block tables
+        # (JAX_SLIDING_WINDOW_KV_CACHE=1); pure_layer_fn reads layer_kwargs at
+        # call time, so swap in this layer's entry before each call.
+        per_layer_attention_metadata = layer_kwargs.get("attention_metadata")
+        if not isinstance(per_layer_attention_metadata, tuple):
+          per_layer_attention_metadata = None
+
         for lyr in range(cfg.num_decoder_layers):
+          if per_layer_attention_metadata is not None:
+            layer_kwargs["attention_metadata"] = per_layer_attention_metadata[lyr]
           if self.is_deepseek:
             if lyr < cfg.first_num_dense_layers:
               layer = getattr(self, f"dense_layers_{lyr}", None)
@@ -1951,7 +1961,16 @@ class NNXDecoder(nnx.Module):
             layer_kwargs["decoder_input_tokens"] = input_tokens
 
           if cfg.remat_policy != "none":
-            y, kv_cache, new_state, new_graphdef = checkpointed_fn(graphdef, state, y, kv_cache)
+            layer_fn = checkpointed_fn
+            if per_layer_attention_metadata is not None:
+              # jax.checkpoint caches its trace on the function, not on what
+              # pure_layer_fn reads from layer_kwargs. Layers with equal
+              # graphdefs would then all reuse layer 0's metadata, so give
+              # each layer its own function object to force a fresh trace.
+              layer_fn = jax.checkpoint(
+                  lambda *args: pure_layer_fn(*args), policy=policy, prevent_cse=prevent_cse
+              )
+            y, kv_cache, new_state, new_graphdef = layer_fn(graphdef, state, y, kv_cache)
           else:
             y, kv_cache, new_state, new_graphdef = pure_layer_fn(graphdef, state, y, kv_cache)
 
