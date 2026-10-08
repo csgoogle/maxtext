@@ -15,11 +15,13 @@
 """Unit tests for MaxText scanned-weight unrolling workarounds."""
 
 from types import SimpleNamespace
+import sys
 import unittest
 from unittest import mock
 import numpy as np
 import pytest
 
+import maxtext.integration.vllm as maxtext_vllm_pkg
 from maxtext.integration.vllm.maxtext_vllm_rollout import (
     _create_model_converter,
     localize_and_reshard_pytree,
@@ -602,8 +604,16 @@ class MaxTextVllmRolloutConfigForwardingTest(unittest.TestCase):
         rollout_tensor_parallelism=4,
     )
     fake_sampler = mock.MagicMock()
+    fake_adapter = mock.MagicMock()
 
     with (
+        mock.patch.dict(sys.modules, {
+            "maxtext.integration.vllm.maxtext_vllm_adapter": fake_adapter,
+        }),
+        # `from maxtext.integration.vllm import maxtext_vllm_adapter` reads the
+        # package attribute once the real module has been imported (another
+        # test may have), so patch it too.
+        mock.patch.object(maxtext_vllm_pkg, "maxtext_vllm_adapter", fake_adapter, create=True),
         mock.patch(
             "maxtext.integration.vllm.maxtext_vllm_rollout.mappings.MappingConfig.build",
             return_value=object(),
@@ -628,6 +638,7 @@ class MaxTextVllmRolloutConfigForwardingTest(unittest.TestCase):
       )
 
     config = sampler_cls.call_args.kwargs["config"]
+    fake_adapter.register.assert_called_once_with()
     self.assertEqual(config.sampling_kwargs, sampling_kwargs)
     self.assertEqual(config.expert_parallel_size, 1)
     self.assertEqual(config.return_logprobs, True)
