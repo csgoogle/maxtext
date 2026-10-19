@@ -1129,6 +1129,13 @@ class HardwareAndMesh(BaseModel):
       "all_gather",
       description="Strategy for context parallelism ('all_gather', 'ring', 'ulysses', or 'usp').",
   )
+  local_context_parallel_strategy: str = Field(
+      "",
+      description=(
+          "Optional context parallel strategy override for LOCAL_SLIDING attention layers "
+          "('', 'all_gather', or 'halo')."
+      ),
+  )
   context_parallel_reorder_strategy: ReorderStrategy = Field(
       ReorderStrategy.AUTO,
       description="Reorder strategy for load-balanced context parallelism.",
@@ -4030,6 +4037,15 @@ class MaxTextConfig(
     if context_parallel_strategy not in ("all_gather", "ring", "ulysses", "usp"):
       raise ValueError("context_parallel_strategy must be one of 'all_gather', 'ring', 'ulysses', or 'usp'.")
     self.context_parallel_strategy = context_parallel_strategy
+    local_context_parallel_strategy = self.local_context_parallel_strategy.lower()
+    if local_context_parallel_strategy not in ("", "all_gather", "halo"):
+      raise ValueError("local_context_parallel_strategy must be one of '', 'all_gather', or 'halo'.")
+    self.local_context_parallel_strategy = local_context_parallel_strategy
+    if local_context_parallel_strategy == "halo":
+      if self.sliding_window_size is None or self.sliding_window_size <= 0:
+        raise ValueError("Halo context parallelism requires sliding_window_size > 0.")
+      if self.use_jax_splash and not self.use_tokamax_splash:
+        raise ValueError("Halo context parallelism supports the Tokamax or the default Splash kernel, not use_jax_splash.")
     if (
         context_parallel_strategy == "ring"
         and "gpu" not in self.hardware
@@ -4146,7 +4162,15 @@ class MaxTextConfig(
             "TPU Ulysses attention requires num_query_heads "
             f"({self.num_query_heads}) to be divisible by context_parallel_size ({context_parallel_size})."
         )
-      if self.num_kv_heads == 1:
+      # With a local_context_parallel_strategy override, Ulysses only runs on the global
+      # layers, so the head-divisibility constraint applies to their KV head count
+      # (global_num_kv_heads, when the model distinguishes it) rather than num_kv_heads.
+      ulysses_num_kv_heads = (
+          self.global_num_kv_heads
+          if self.global_num_kv_heads > 0 and local_context_parallel_strategy
+          else self.num_kv_heads
+      )
+      if ulysses_num_kv_heads == 1:
         raise ValueError("TPU Ulysses attention does not support MQA with context_parallel_size > 1.")
       # Either the KV heads split across the exchange, or they replicate up to
       # it: ulysses_all_to_all_kv repeats each head context_parallel_size //
@@ -4155,12 +4179,12 @@ class MaxTextConfig(
       # the second branch Gemma4-31B's 4 global KV heads capped context
       # parallelism at 4 regardless of its 32 query heads.
       if (
-          self.num_kv_heads % context_parallel_size != 0
-          and context_parallel_size % self.num_kv_heads != 0
+          ulysses_num_kv_heads % context_parallel_size != 0
+          and context_parallel_size % ulysses_num_kv_heads != 0
       ):
         raise ValueError(
             "TPU Ulysses attention requires num_kv_heads "
-            f"({self.num_kv_heads}) and context_parallel_size "
+            f"({ulysses_num_kv_heads}) and context_parallel_size "
             f"({context_parallel_size}) to divide one another."
         )
     self._validate_usp_context_parallelism()
